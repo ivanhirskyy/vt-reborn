@@ -5,7 +5,8 @@
   "scripts": {
     "in": "bun run src/punch.ts in",
     "out": "bun run src/punch.ts out",
-    "start": "bun run src/scheduler.ts"
+    "start": "bun run src/scheduler.ts",
+    "backfill": "bun run src/backfill.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

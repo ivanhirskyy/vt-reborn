@@ -12,12 +12,12 @@ function getJitterMs(maxMinutes: number): number {
 
 async function executePunch(
   type: "in" | "out",
-  jitterMinutes: number
+  jitterMinutes: number,
 ): Promise<void> {
   const jitterMs = getJitterMs(jitterMinutes);
   const jitterSecs = Math.round(jitterMs / 1000);
   console.log(
-    `[${new Date().toISOString()}] Punch ${type.toUpperCase()} scheduled, waiting ${jitterSecs}s jitter...`
+    `[${new Date().toISOString()}] Punch ${type.toUpperCase()} scheduled, waiting ${jitterSecs}s jitter...`,
   );
   await sleep(jitterMs);
 
@@ -27,11 +27,10 @@ async function executePunch(
   try {
     const credentials = getCredentials();
     const session = await login(credentials);
-    const direction = type === "in" ? "E" : "S";
-    const result = await punch(session, credentials, direction);
+    const result = await punch(session, type);
 
     console.log(
-      `[${timestamp}] Punch ${type.toUpperCase()} successful (status: ${result.status})`
+      `[${timestamp}] Punch ${type.toUpperCase()} successful (status: ${result.status})`,
     );
     await updateState({ lastPunch: { type, timestamp } });
   } catch (error) {
@@ -61,7 +60,7 @@ async function main(): Promise<void> {
       },
       {
         timezone: config.timezone,
-      }
+      },
     );
   }
 

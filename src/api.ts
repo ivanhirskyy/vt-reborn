@@ -1,8 +1,13 @@
 import type {
   Credentials,
+  EmployeePunch,
+  GetMyPunchesResponse,
   LoginResponse,
+  SaveForbiddenPunchResponse,
   SetStatusResponse,
 } from "./types";
+
+type PunchDirection = "in" | "out";
 
 const PORTAL_URL = "https://vtportal.visualtime.net/api/portalsvcx.svc";
 
@@ -12,6 +17,7 @@ export interface Session {
   employeeName: string;
   guid: string;
   cookies: string;
+  companyId: string;
   presenceStatus: string;
   lastPunchDirection: string;
   lastPunchDate: Date | null;
@@ -79,6 +85,7 @@ export async function login(credentials: Credentials): Promise<Session> {
     employeeName: status.EmployeeName,
     guid,
     cookies,
+    companyId: credentials.companyId,
     presenceStatus: status.PresenceStatus || "Unknown",
     lastPunchDirection: status.LastPunchDirection || "Unknown",
     lastPunchDate,
@@ -87,13 +94,12 @@ export async function login(credentials: Credentials): Promise<Session> {
 
 export async function punch(
   session: Session,
-  credentials: Credentials,
-  direction: "E" | "S" = "E"
+  direction: PunchDirection = "in",
 ): Promise<{ success: boolean; status: string; direction: string }> {
-  // direction: "E" = Entry (clock in), "S" = Sortie (clock out)
+  const apiDirection = direction === "in" ? "E" : "S";
   const params = new URLSearchParams({
     causeId: "0",
-    direction,
+    direction: apiDirection,
     latitude: "-1",
     longitude: "-1",
     identifier: "",
@@ -108,21 +114,18 @@ export async function punch(
     timestamp: Date.now().toString(),
   });
 
-  const response = await fetch(
-    `${PORTAL_URL}/SetStatus?${params.toString()}`,
-    {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        roAuth: session.guid,
-        roToken: session.token,
-        roSrc: "false",
-        roCompanyID: credentials.companyId,
-        roApp: "VTPortal",
-        Cookie: session.cookies,
-      },
-    }
-  );
+  const response = await fetch(`${PORTAL_URL}/SetStatus?${params.toString()}`, {
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      roAuth: session.guid,
+      roToken: session.token,
+      roSrc: "false",
+      roCompanyID: session.companyId,
+      roApp: "VTPortal",
+      Cookie: session.cookies,
+    },
+  });
 
   if (!response.ok) {
     throw new Error(`Punch failed: ${response.status} ${response.statusText}`);
@@ -132,7 +135,7 @@ export async function punch(
 
   if (data.d.Status !== 0) {
     throw new Error(
-      `Punch failed with status: ${data.d.Status} (${data.d.CustomErrorText || "unknown error"})`
+      `Punch failed with status: ${data.d.Status} (${data.d.CustomErrorText || "unknown error"})`,
     );
   }
 
@@ -143,17 +146,103 @@ export async function punch(
   };
 }
 
-export async function getStatus(credentials: Credentials): Promise<{
-  employeeName: string;
-  presenceStatus: string;
-  lastPunchDirection: string;
-  lastPunchDate: Date | null;
-}> {
-  const session = await login(credentials);
-  return {
-    employeeName: session.employeeName,
-    presenceStatus: session.presenceStatus,
-    lastPunchDirection: session.lastPunchDirection,
-    lastPunchDate: session.lastPunchDate,
-  };
+export async function getMyPunches(
+  session: Session,
+  date: string, // "DD/MM/YYYY"
+): Promise<EmployeePunch[]> {
+  const params = new URLSearchParams({
+    selectedDate: date,
+    timestamp: "0",
+    _: Date.now().toString(),
+  });
+
+  const response = await fetch(`${PORTAL_URL}/GetMyPunches?${params}`, {
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      roAuth: session.guid,
+      roToken: session.token,
+      roSrc: "false",
+      roCompanyID: session.companyId,
+      roApp: "VTPortal",
+      Cookie: session.cookies,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `GetMyPunches failed: ${response.status} ${response.statusText}`,
+    );
+  }
+
+  const data = (await response.json()) as GetMyPunchesResponse;
+  return data.d.Punches ?? [];
+}
+
+async function doSaveForbiddenPunch(
+  session: Session,
+  punchDateTime: string,
+  apiDirection: "E" | "S",
+  acceptWarning: boolean,
+): Promise<SaveForbiddenPunchResponse> {
+  const formData = new FormData();
+  formData.append("punchDate", punchDateTime);
+  formData.append("idCause", "144"); // PT esquecimento de picagem
+  formData.append("comments", "");
+  formData.append("direction", apiDirection);
+  formData.append("acceptWarning", acceptWarning ? "true" : "false");
+  formData.append("tcType", "0");
+
+  const response = await fetch(`${PORTAL_URL}/SaveRequestForbiddenPunch`, {
+    method: "POST",
+    headers: {
+      roAuth: session.guid,
+      roToken: session.token,
+      roSrc: "false",
+      roCompanyID: session.companyId,
+      roApp: "VTPortal",
+      Cookie: session.cookies,
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `SaveForbiddenPunch failed: ${response.status} ${response.statusText}`,
+    );
+  }
+
+  return (await response.json()) as SaveForbiddenPunchResponse;
+}
+
+export async function saveForbiddenPunch(
+  session: Session,
+  punchDateTime: string, // "YYYY-MM-DD HH:MM"
+  direction: PunchDirection,
+): Promise<{ requestId: number }> {
+  const apiDirection = direction === "in" ? "E" : "S";
+  let data = await doSaveForbiddenPunch(
+    session,
+    punchDateTime,
+    apiDirection,
+    false,
+  );
+
+  // A negative status indicates a warning (e.g. nearby punch exists).
+  // Retry with acceptWarning: true to confirm and push through.
+  if (!data.d.Result && data.d.Status < 0) {
+    data = await doSaveForbiddenPunch(
+      session,
+      punchDateTime,
+      apiDirection,
+      true,
+    );
+  }
+
+  if (!data.d.Result) {
+    throw new Error(
+      `SaveForbiddenPunch rejected (status: ${data.d.Status})\n  StatusErrorMsg: ${JSON.stringify(data.d.StatusErrorMsg)}\n  StatusInfoMsg:  ${JSON.stringify(data.d.StatusInfoMsg)}\n  Full response:  ${JSON.stringify(data.d)}`,
+    );
+  }
+
+  return { requestId: data.d.RequestId };
 }

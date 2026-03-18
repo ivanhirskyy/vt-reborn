@@ -14,9 +14,8 @@ try {
   const session = await login(credentials);
   console.log(`Logged in as: ${session.employeeName}`);
 
-  const apiDirection = direction === "in" ? "E" : "S";
   console.log(`Clocking ${direction}...`);
-  const result = await punch(session, credentials, apiDirection);
+  const result = await punch(session, direction);
 
   console.log(`Clocked ${direction}! Status: ${result.status}`);
   await updateState({

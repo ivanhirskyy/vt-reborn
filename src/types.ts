@@ -28,6 +28,33 @@ export interface SetStatusResponse {
   };
 }
 
+export interface EmployeePunch {
+  ActualType: number; // 1=in, 2=out
+  DateTime: string; // "/Date(timestamp+offset)/"
+  ID: number;
+  Type: number; // 1=in, 2=out
+  TypeData: number;
+  RelatedInfo: string;
+}
+
+export interface GetMyPunchesResponse {
+  d: {
+    Punches: EmployeePunch[];
+    Status: number;
+  };
+}
+
+export interface SaveForbiddenPunchResponse {
+  d: {
+    PunchWithoutRequest: boolean;
+    RequestId: number;
+    Result: boolean;
+    Status: number;
+    StatusErrorMsg: string;
+    StatusInfoMsg: string | null;
+  };
+}
+
 // Config Types
 
 export interface ScheduledPunch {
