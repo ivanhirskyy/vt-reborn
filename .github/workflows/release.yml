@@ -17,7 +17,7 @@ jobs:
         run: ./scripts/build-app.sh
 
       - name: Zip
-        run: cd dist && zip -r VTPuncher.zip VTPuncher.app
+        run: cd dist && zip -r vt-reborn.zip vt-reborn.app
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -26,5 +26,5 @@ jobs:
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
-          files: dist/VTPuncher.zip
+          files: dist/vt-reborn.zip
           generate_release_notes: true

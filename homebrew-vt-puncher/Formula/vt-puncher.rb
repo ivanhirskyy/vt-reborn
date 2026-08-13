@@ -1,33 +1,33 @@
-class VtPuncher < Formula
-  desc "VT Puncher - Native macOS replacement for the VisualTime portal"
+class VtReborn < Formula
+  desc "vt-reborn - Native macOS replacement for the VisualTime portal"
   homepage "https://github.com/ivanhirskyy/vt-reborn"
   version "1.0.0"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/ivanhirskyy/vt-reborn/releases/download/v#{version}/VTPuncher.zip"
-      sha256 "REPLACE_WITH_ACTUAL_SHA256_AFTER_FIRST_RELEASE"
+      url "https://github.com/ivanhirskyy/vt-reborn/releases/download/v#{version}/vt-reborn.zip"
+      sha256 "0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5"
     else
-      url "https://github.com/ivanhirskyy/vt-reborn/releases/download/v#{version}/VTPuncher.zip"
-      sha256 "REPLACE_WITH_ACTUAL_SHA256_AFTER_FIRST_RELEASE"
+      url "https://github.com/ivanhirskyy/vt-reborn/releases/download/v#{version}/vt-reborn.zip"
+      sha256 "0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5"
     end
   end
 
   def install
-    prefix.install "VTPuncher.app"
-    bin.write_exec_script prefix/"VTPuncher.app/Contents/MacOS/VTPuncher"
+    prefix.install "vt-reborn.app"
+    bin.write_exec_script prefix/"vt-reborn.app/Contents/MacOS/vt-reborn"
   end
 
   def caveats
     <<~EOS
-      VTPuncher.app installed to #{opt_prefix}
-      Run with: vt-puncher
+      vt-reborn.app installed to #{opt_prefix}
+      Run with: vt-reborn
       Or open from Applications/Spotlight.
     EOS
   end
 
   test do
-    assert_predicate prefix/"VTPuncher.app", :exist?
+    assert_predicate prefix/"vt-reborn.app", :exist?
   end
 end

@@ -8,13 +8,13 @@ echo "Building release binary..."
 swift build -c release
 
 BIN_DIR="$(swift build -c release --show-bin-path)"
-APP="$ROOT/dist/VTPuncher.app"
+APP="$ROOT/dist/vt-reborn.app"
 
 echo "Assembling $APP..."
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
-cp "$BIN_DIR/VTPuncher" "$APP/Contents/MacOS/VTPuncher"
+cp "$BIN_DIR/VTPuncher" "$APP/Contents/MacOS/vt-reborn"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,13 +22,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>VTPuncher</string>
+	<string>vt-reborn</string>
 	<key>CFBundleDisplayName</key>
-	<string>VT Puncher</string>
+	<string>vt-reborn</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.vtpuncher.app</string>
+	<string>local.vt-reborn.app</string>
 	<key>CFBundleExecutable</key>
-	<string>VTPuncher</string>
+	<string>vt-reborn</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
