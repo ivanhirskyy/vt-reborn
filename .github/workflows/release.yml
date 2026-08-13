@@ -1,0 +1,34 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app
+        run: |
+          cd macapp
+          ./scripts/build-app.sh
+
+      - name: Zip
+        run: |
+          cd macapp/dist
+          zip -r VTPuncher.zip VTPuncher.app
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: macapp/dist/VTPuncher.zip
+          generate_release_notes: true
