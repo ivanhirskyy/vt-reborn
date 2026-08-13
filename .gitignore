@@ -38,3 +38,7 @@ state.json
 
 # VT config (user-specific)
 config.json
+
+# macOS app build artifacts
+macapp/.build
+macapp/dist
