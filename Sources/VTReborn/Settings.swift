@@ -75,7 +75,7 @@ final class AppSettings: ObservableObject {
         vtPassword = defaults.string(forKey: Keys.vtPassword) ?? ""
         vtCompanyId = defaults.string(forKey: Keys.vtCompanyId) ?? ""
 
-        // One-time import from the legacy ~/Dachdev/vt-puncher/.env file.
+        // One-time import from the legacy ~/Dachdev/vt-reborn/.env file.
         if !hasValidCredentials {
             moveCredentialsFromEnvFile()
         }
@@ -86,7 +86,7 @@ final class AppSettings: ObservableObject {
     private func moveCredentialsFromEnvFile() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let envURL = URL(fileURLWithPath: home)
-            .appendingPathComponent("Dachdev/vt-puncher")
+            .appendingPathComponent("Dachdev/vt-reborn")
             .appendingPathComponent(".env")
 
         guard let content = try? String(contentsOf: envURL, encoding: .utf8) else { return }

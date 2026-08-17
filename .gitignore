@@ -47,3 +47,6 @@ macapp/dist
 # regenerable icon intermediates (run scripts/make-icon.py to rebuild)
 Resources/AppIcon.iconset
 Resources/AppIcon-1024.png
+
+# separate git repo (its own remote), not part of this project's history
+homebrew-vt-reborn/

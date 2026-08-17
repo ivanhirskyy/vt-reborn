@@ -16,7 +16,7 @@ The official VisualTime portal is slow, clunky, and web-based. This app gives yo
 
 ### Homebrew (recommended)
 ```bash
-brew tap ivanhirskyy/vt-puncher
+brew tap ivanhirskyy/vt-reborn
 brew install --cask vt-reborn
 ```
 This installs `vt-reborn.app` into `/Applications` — same as dragging it there

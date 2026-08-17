@@ -15,7 +15,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 
-cp "$BIN_DIR/VTPuncher" "$APP/Contents/MacOS/vt-reborn"
+cp "$BIN_DIR/VTReborn" "$APP/Contents/MacOS/vt-reborn"
 
 if [ ! -f "$ROOT/Resources/AppIcon.icns" ]; then
 	echo "Generating app icon..."

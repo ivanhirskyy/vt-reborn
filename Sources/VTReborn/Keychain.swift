@@ -2,7 +2,7 @@ import Foundation
 import Security
 
 enum Keychain {
-    private static let service = "com.vtpuncher.app"
+    private static let service = "com.vt-reborn.app"
 
     static func save(key: String, data: Data) -> Bool {
         let query: [String: Any] = [

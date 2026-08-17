@@ -986,7 +986,7 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
 
     private static func cacheURL() -> URL? {
         guard let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
-        let appDir = dir.appendingPathComponent("VTPuncher", isDirectory: true)
+        let appDir = dir.appendingPathComponent("VTReborn", isDirectory: true)
         try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
         return appDir.appendingPathComponent("week.json")
     }

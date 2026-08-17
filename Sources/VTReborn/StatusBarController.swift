@@ -132,7 +132,7 @@ private func showPopover() {
         let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refreshAction), keyEquivalent: "r")
         refreshItem.target = self
         let quitItem = NSMenuItem(
-            title: "Quit VTPuncher",
+            title: "Quit vt-reborn",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )

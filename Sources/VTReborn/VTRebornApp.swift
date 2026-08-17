@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct VTPuncherApp: App {
+struct VTRebornApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {

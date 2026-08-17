@@ -2,14 +2,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "VTPuncher",
+    name: "VTReborn",
     platforms: [
         .macOS(.v13)
     ],
     targets: [
         .executableTarget(
-            name: "VTPuncher",
-            path: "Sources/VTPuncher"
+            name: "VTReborn",
+            path: "Sources/VTReborn"
         )
     ]
 )
