@@ -23,6 +23,16 @@ brew install vt-reborn
 ### Manual
 Download `vt-reborn.zip` from [Releases](https://github.com/ivanhirskyy/vt-reborn/releases), unzip, and run.
 
+### From source (install to /Applications)
+```bash
+git clone https://github.com/ivanhirskyy/vt-reborn.git
+cd vt-reborn
+./scripts/install-app.sh
+```
+This builds the app, installs it to `~/Applications/vt-reborn.app`, pins it to the
+Dock, and launches it. Re-run the same command any time to update to the latest
+source — it replaces the installed copy and restarts the app.
+
 ## Build from source
 ```bash
 git clone https://github.com/ivanhirskyy/vt-reborn.git
@@ -30,6 +40,7 @@ cd vt-reborn
 ./scripts/build-app.sh
 open dist/vt-reborn.app
 ```
+(Use this if you just want a local build without installing/pinning it.)
 
 ## Configuration
 1. Open the app → Settings tab

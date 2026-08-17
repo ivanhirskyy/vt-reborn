@@ -40,5 +40,10 @@ state.json
 config.json
 
 # macOS app build artifacts
+.build
 macapp/.build
 macapp/dist
+
+# regenerable icon intermediates (run scripts/make-icon.py to rebuild)
+Resources/AppIcon.iconset
+Resources/AppIcon-1024.png

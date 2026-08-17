@@ -13,8 +13,15 @@ APP="$ROOT/dist/vt-reborn.app"
 echo "Assembling $APP..."
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/Resources"
 
 cp "$BIN_DIR/VTPuncher" "$APP/Contents/MacOS/vt-reborn"
+
+if [ ! -f "$ROOT/Resources/AppIcon.icns" ]; then
+	echo "Generating app icon..."
+	python3 "$ROOT/scripts/make-icon.py"
+fi
+cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -29,6 +36,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<string>local.vt-reborn.app</string>
 	<key>CFBundleExecutable</key>
 	<string>vt-reborn</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
