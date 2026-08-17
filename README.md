@@ -17,8 +17,15 @@ The official VisualTime portal is slow, clunky, and web-based. This app gives yo
 ### Homebrew (recommended)
 ```bash
 brew tap ivanhirskyy/vt-puncher
-brew install vt-reborn
+brew install --cask vt-reborn
 ```
+This installs `vt-reborn.app` into `/Applications` — same as dragging it there
+by hand. It shows up in Launchpad, Spotlight, and the Dock like any other app.
+Update later with `brew upgrade --cask vt-reborn`.
+
+The app is ad-hoc signed, not notarized by Apple, so Gatekeeper will likely
+block it on first open — right-click the app in Applications and choose
+"Open" once to bypass the warning.
 
 ### Manual
 Download `vt-reborn.zip` from [Releases](https://github.com/ivanhirskyy/vt-reborn/releases), unzip, and run.
