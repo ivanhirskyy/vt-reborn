@@ -14,6 +14,8 @@ The official VisualTime portal is slow, clunky, and web-based. This app gives yo
 
 ## Install
 
+Not sure which to pick? Use Homebrew.
+
 ### Homebrew (recommended)
 ```bash
 brew tap ivanhirskyy/vt-reborn
@@ -23,14 +25,10 @@ This installs `vt-reborn.app` into `/Applications` — same as dragging it there
 by hand. It shows up in Launchpad, Spotlight, and the Dock like any other app.
 Update later with `brew upgrade --cask vt-reborn`.
 
-The app is ad-hoc signed, not notarized by Apple, so Gatekeeper will likely
-block it on first open — right-click the app in Applications and choose
-"Open" once to bypass the warning.
-
 ### Manual
 Download `vt-reborn.zip` from [Releases](https://github.com/ivanhirskyy/vt-reborn/releases), unzip, and run.
 
-### From source (install to /Applications)
+### From source
 ```bash
 git clone https://github.com/ivanhirskyy/vt-reborn.git
 cd vt-reborn
@@ -40,14 +38,18 @@ This builds the app, installs it to `~/Applications/vt-reborn.app`, pins it to t
 Dock, and launches it. Re-run the same command any time to update to the latest
 source — it replaces the installed copy and restarts the app.
 
-## Build from source
+All three methods produce the same ad-hoc signed app (not notarized by Apple),
+so Gatekeeper will likely block it on first open — right-click the app in
+Applications and choose "Open" once to bypass the warning.
+
+## Build without installing
+Just want a local build without installing or pinning it to the Dock?
 ```bash
 git clone https://github.com/ivanhirskyy/vt-reborn.git
 cd vt-reborn
 ./scripts/build-app.sh
 open dist/vt-reborn.app
 ```
-(Use this if you just want a local build without installing/pinning it.)
 
 ## Configuration
 1. Open the app → Settings tab
