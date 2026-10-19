@@ -147,7 +147,7 @@ struct GetAccrualsSummaryResponse: Decodable {
 
 // MARK: - Calendar
 
-struct CalendarDayData: Identifiable {
+struct CalendarDayData: Identifiable, Codable {
     let date: Date
     let weekday: String
     let dayNumber: Int

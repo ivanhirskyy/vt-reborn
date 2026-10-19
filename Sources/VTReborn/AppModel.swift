@@ -30,7 +30,7 @@ struct WeekData: Codable {
     let lastPunchDirection: String
     let lastPunchDate: String?
     let weekStart: String
-    let days: [DayData]
+    var days: [DayData]
 }
 
 struct DayVM: Identifiable {
@@ -146,6 +146,11 @@ final class AppModel: ObservableObject {
     /// months never triggers a network round-trip.
     private var calendarFetchedMonths: Set<Int> = []
 
+    /// When the loaded week was last confirmed against the portal.
+    private var lastWeekRefresh: Date?
+    /// A week refreshed this recently is trusted for the backfill preview.
+    private static let freshWeekWindow: TimeInterval = 120
+
     private var scheduledTimers: [Timer] = []
     private var dayReArmTimer: Timer?
 
@@ -161,6 +166,7 @@ final class AppModel: ObservableObject {
         weekStart = Self.monday(of: Date())
         calendarMonthStart = Self.firstOfMonth(of: Date())
         week = Self.loadCachedWeek()
+        loadCachedCalendar()
     }
 
     private let api = VTAPIClient()
@@ -322,24 +328,13 @@ final class AppModel: ObservableObject {
             appendLog("Refreshing \(dmy)…")
 
             let (session, days, calDays, requests): (Session, [DayData], [CalendarDayData], [VacationRequest]) = try await withSession { session in
-                var days: [DayData] = []
-                var monthStarts: [Date] = []
-                for i in 0..<5 {
-                    let day = cal.date(byAdding: .day, value: i, to: start)!
-                    let dayDMY = Self.dmyString(day)
-                    monthStarts.append(Self.firstOfMonth(of: day))
-                    let punches = try await api.getMyPunches(session, date: dayDMY)
-                    days.append(DayData(
-                        date: Self.dateFormatter.ymd(from: day),
-                        dmy: dayDMY,
-                        punches: punches
-                            .sorted { PunchFormat.ms($0.dateTime) < PunchFormat.ms($1.dateTime) }
-                            .map { Punch(time: PunchFormat.wallTime($0.dateTime), type: $0.actualType == 1 ? "in" : "out") }
-                    ))
-                }
-                let weekMonthStarts = Array(Set(monthStarts))
+                let dates = (0..<5).map { cal.date(byAdding: .day, value: $0, to: start)! }
+                let weekMonthStarts = Array(Set(dates.map { Self.firstOfMonth(of: $0) }))
+                // Punches, calendar and requests are independent: run them all
+                // concurrently so the refresh costs one round trip, not seven.
                 async let calDays = self.fetchCalendarMonths(session, months: weekMonthStarts)
                 async let requests = self.api.getMyRequests(session, selectedDate: Self.dmyString(start))
+                let days = try await self.fetchDays(session, dates: dates)
                 return (session, days, try await calDays, try await requests)
             }
 
@@ -353,6 +348,7 @@ final class AppModel: ObservableObject {
             )
             week = fresh
             isStale = false
+            lastWeekRefresh = Date()
             mergeCalendarDays(calDays)
             vacationDates = Self.parseVacationDates(from: requests)
             Self.saveCachedWeek(fresh)
@@ -366,6 +362,48 @@ final class AppModel: ObservableObject {
             }
         }
         isRefreshing = false
+    }
+
+    /// Fetches the given days' punches in parallel, returned in input order.
+    private func fetchDays(_ session: Session, dates: [Date]) async throws -> [DayData] {
+        try await withThrowingTaskGroup(of: (Int, DayData).self) { group in
+            for (i, date) in dates.enumerated() {
+                // Formatters are main-actor state; resolve labels before forking.
+                let dmy = Self.dmyString(date)
+                let iso = Self.dateFormatter.ymd(from: date)
+                group.addTask { [api] in
+                    let punches = try await api.getMyPunches(session, date: dmy)
+                    return (i, DayData(
+                        date: iso,
+                        dmy: dmy,
+                        punches: punches
+                            .sorted { PunchFormat.ms($0.dateTime) < PunchFormat.ms($1.dateTime) }
+                            .map { Punch(time: PunchFormat.wallTime($0.dateTime), type: $0.actualType == 1 ? "in" : "out") }
+                    ))
+                }
+            }
+            var result: [(Int, DayData)] = []
+            for try await item in group { result.append(item) }
+            return result.sorted { $0.0 < $1.0 }.map { $0.1 }
+        }
+    }
+
+    /// Re-fetches a single day and patches it into the loaded week, instead of
+    /// reloading the whole week after a one-day change (e.g. a backfill).
+    private func refreshDay(_ date: Date) async {
+        do {
+            let fresh = try await withSession { try await fetchDays($0, dates: [date]) }
+            guard let day = fresh.first, var current = week,
+                  let idx = current.days.firstIndex(where: { $0.date == day.date }) else { return }
+            current.days[idx] = day
+            week = current
+            isStale = false
+            lastWeekRefresh = Date()
+            Self.saveCachedWeek(current)
+        } catch {
+            appendLog(error.localizedDescription, level: .error)
+            if isSessionExpiredError(error) { handleSessionExpiry() }
+        }
     }
 
     // MARK: - Punch in/out
@@ -708,6 +746,32 @@ final class AppModel: ObservableObject {
         var byDate = Dictionary(uniqueKeysWithValues: calendarDays.map { ($0.date, $0) })
         for day in new { byDate[day.date] = day }
         calendarDays = byDate.values.sorted { $0.date < $1.date }
+        Self.saveCachedCalendar(calendarDays)
+    }
+
+    /// Restores the calendar from disk so the vacation tab renders instantly.
+    /// Months before the current one no longer change, so they count as fetched
+    /// and are never requested again; the current and future months are still
+    /// refreshed once per launch.
+    private func loadCachedCalendar() {
+        guard let url = Self.calendarCacheURL(),
+              let data = try? Data(contentsOf: url),
+              let days = try? JSONDecoder().decode([CalendarDayData].self, from: data) else { return }
+        calendarDays = days
+        let currentKey = calendarMonthKey(Self.firstOfMonth(of: Date()))
+        calendarFetchedMonths = Set(days.map { calendarMonthKey($0.date) }.filter { $0 < currentKey })
+    }
+
+    private static func calendarCacheURL() -> URL? {
+        cacheURL()?.deletingLastPathComponent().appendingPathComponent("calendar.json")
+    }
+
+    private static func saveCachedCalendar(_ days: [CalendarDayData]) {
+        guard let url = calendarCacheURL() else { return }
+        Task.detached(priority: .utility) {
+            guard let data = try? JSONEncoder().encode(days) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
     }
 
     private func calendarMonthKey(_ date: Date) -> Int {
@@ -817,20 +881,11 @@ struct BackfillPlan: Identifiable {
     var isSelectable: Bool { canSubmit || isProblem }
 }
 
-private func buildBackfillPlan(for date: Date, existing: [EmployeePunch], configs: [PunchConfig]) -> [BackfillPlan] {
+private func buildBackfillPlan(for date: Date, existingWall: [(time: String, type: String)], configs: [PunchConfig]) -> [BackfillPlan] {
     let cal = Calendar.current
     let isToday = cal.isDateInToday(date)
     let now = Date()
     let nowMins = isToday ? hourMinToMins(timeHM(now)) : Int.max  // past days = all due
-
-    // Convert existing portal punches to local wall times
-    let existingWall: [(time: String, type: String)] = existing.compactMap { p in
-        guard let (ms, offset) = PunchFormat.wallClockDate(p.dateTime) else { return nil }
-        let local = Date(timeIntervalSince1970: ms / 1000.0 + offset)
-        let hm = String(PunchFormat.timeFormatter.string(from: local).prefix(5))
-        let dir = p.actualType == 1 ? "in" : "out"
-        return (hm, dir)
-    }
 
     var usedExisting = Set<Int>()
     var plans: [BackfillPlan] = []
@@ -977,6 +1032,14 @@ func backfill(date: Date) {
     backfillCore(date: date, dmy: Self.dmyString(date), isFuture: false)
 }
 
+/// Punches for `date` from the loaded week, only when the week was refreshed
+/// within `freshWeekWindow` (so a stale cache can't cause a duplicate submit).
+private func freshCachedPunches(for date: Date) -> [Punch]? {
+    guard let last = lastWeekRefresh, Date().timeIntervalSince(last) < Self.freshWeekWindow,
+          let day = week?.days.first(where: { $0.date == Self.dateFormatter.ymd(from: date) }) else { return nil }
+    return day.punches
+}
+
 private func backfillCore(date: Date, dmy: String, isFuture: Bool) {
     guard !isFuture else {
         appendLog("Cannot backfill a future day.", level: .error)
@@ -992,8 +1055,15 @@ private func backfillCore(date: Date, dmy: String, isFuture: Bool) {
     Task {
         do {
             let session = try await requireSession()
-            let existingPortal = try await api.getMyPunches(session, date: dmy)
-            let plans = buildBackfillPlan(for: date, existing: existingPortal, configs: settings.punchConfigs)
+            let existingWall: [(time: String, type: String)]
+            if let cached = freshCachedPunches(for: date) {
+                // The week was confirmed moments ago; skip the round trip.
+                existingWall = cached.map { ($0.time, $0.type) }
+            } else {
+                let portal = try await api.getMyPunches(session, date: dmy)
+                existingWall = portal.map { (PunchFormat.wallTime($0.dateTime), $0.actualType == 1 ? "in" : "out") }
+            }
+            let plans = buildBackfillPlan(for: date, existingWall: existingWall, configs: settings.punchConfigs)
 
             let missingCount = plans.filter { $0.canSubmit }.count
             let conflictCount = plans.filter { $0.isProblem }.count
@@ -1054,7 +1124,7 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
         }
     }
     isBusy = false
-    await refresh()
+    await refreshDay(date)
     await refreshAlerts()
 }
 
