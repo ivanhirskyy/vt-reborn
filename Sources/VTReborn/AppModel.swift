@@ -48,6 +48,9 @@ struct DayVM: Identifiable {
     let shiftShortName: String?
     var id: Int { index }
 
+    /// Vacation, holiday and bank-holiday days need no punches.
+    var isNonWorking: Bool { isVacation || isHoliday || isBankHoliday }
+
     var isFuture: Bool {
         Calendar.current.startOfDay(for: Date()) < date
     }
@@ -151,6 +154,10 @@ final class AppModel: ObservableObject {
     /// A week refreshed this recently is trusted for the backfill preview.
     private static let freshWeekWindow: TimeInterval = 120
 
+    /// Past days whose bookends are recorded. They can never change again, so
+    /// they're persisted permanently and never re-fetched.
+    private var settledDays: [String: DayData] = [:]
+
     private var scheduledTimers: [Timer] = []
     private var dayReArmTimer: Timer?
 
@@ -167,6 +174,7 @@ final class AppModel: ObservableObject {
         calendarMonthStart = Self.firstOfMonth(of: Date())
         week = Self.loadCachedWeek()
         loadCachedCalendar()
+        loadSettledDays()
     }
 
     private let api = VTAPIClient()
@@ -265,6 +273,7 @@ final class AppModel: ObservableObject {
             let iso = Self.dateFormatter.ymd(from: date)
             let punches = punchByDate[iso] ?? []
             let calendarDay = calendarByDate[cal.startOfDay(for: date)]
+            let nonWorking = isNonWorkingDay(date)
             return DayVM(
                 index: i,
                 date: date,
@@ -273,7 +282,9 @@ final class AppModel: ObservableObject {
                 dmy: dmy(date),
                 isToday: cal.isDate(date, inSameDayAs: today),
                 punches: punches,
-                status: DayStatus(from: punches, isToday: cal.isDate(date, inSameDayAs: today)),
+                status: nonWorking && punches.isEmpty && date <= today
+                    ? .complete
+                    : DayStatus(from: punches, isToday: cal.isDate(date, inSameDayAs: today)),
                 isVacation: vacationDates.contains(cal.startOfDay(for: date)),
                 isHoliday: calendarDay?.isHoliday ?? false,
                 isBankHoliday: calendarDay?.isBankHoliday ?? false,
@@ -318,6 +329,7 @@ final class AppModel: ObservableObject {
     // MARK: - Week refresh
 
     func refresh() async {
+        if showSettledWeekIfPossible() { return }
         let cal = Calendar.current
         let start = Self.monday(of: weekStart)
         let c = cal.dateComponents([.day, .month, .year], from: start)
@@ -347,6 +359,7 @@ final class AppModel: ObservableObject {
                 days: days
             )
             week = fresh
+            recordSettled(days)
             isStale = false
             lastWeekRefresh = Date()
             mergeCalendarDays(calDays)
@@ -365,12 +378,17 @@ final class AppModel: ObservableObject {
     }
 
     /// Fetches the given days' punches in parallel, returned in input order.
+    /// Settled past days come straight from the local store with no request.
     private func fetchDays(_ session: Session, dates: [Date]) async throws -> [DayData] {
         try await withThrowingTaskGroup(of: (Int, DayData).self) { group in
             for (i, date) in dates.enumerated() {
                 // Formatters are main-actor state; resolve labels before forking.
                 let dmy = Self.dmyString(date)
                 let iso = Self.dateFormatter.ymd(from: date)
+                if let settled = settledDays[iso] {
+                    group.addTask { (i, settled) }
+                    continue
+                }
                 group.addTask { [api] in
                     let punches = try await api.getMyPunches(session, date: dmy)
                     return (i, DayData(
@@ -388,6 +406,77 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// True once `day` is in the past with its bookends recorded.
+    private func isSettled(_ day: DayData, today: Date = Date()) -> Bool {
+        guard day.date < Self.dateFormatter.ymd(from: today) else { return false }
+        return DayStatus(from: day.punches, isToday: false) == .complete
+    }
+
+    /// Adds newly settled days to the permanent store.
+    private func recordSettled(_ days: [DayData]) {
+        var changed = false
+        for day in days where settledDays[day.date] == nil && isSettled(day) {
+            settledDays[day.date] = day
+            changed = true
+        }
+        guard changed, let url = Self.settledCacheURL() else { return }
+        let snapshot = settledDays
+        Task.detached(priority: .utility) {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    private func loadSettledDays() {
+        guard let url = Self.settledCacheURL(),
+              let data = try? Data(contentsOf: url),
+              let days = try? JSONDecoder().decode([String: DayData].self, from: data) else { return }
+        settledDays = days
+    }
+
+    private static func settledCacheURL() -> URL? {
+        cacheURL()?.deletingLastPathComponent().appendingPathComponent("settled-days.json")
+    }
+
+    /// Vacation, holiday or bank holiday according to the loaded requests/calendar.
+    private func isNonWorkingDay(_ date: Date) -> Bool {
+        let day = Calendar.current.startOfDay(for: date)
+        if vacationDates.contains(day) { return true }
+        guard let c = calendarDays.first(where: { Calendar.current.startOfDay(for: $0.date) == day }) else { return false }
+        return c.isVacation || c.isHoliday || c.isBankHoliday
+    }
+
+    /// If every weekday of the displayed week is settled, shows it from the
+    /// local store and returns true — no network involved.
+    private func showSettledWeekIfPossible() -> Bool {
+        let cal = Calendar.current
+        let start = Self.monday(of: weekStart)
+        let today = cal.startOfDay(for: Date())
+        var days: [DayData] = []
+        for i in 0..<5 {
+            let date = cal.date(byAdding: .day, value: i, to: start)!
+            let iso = Self.dateFormatter.ymd(from: date)
+            if let settled = settledDays[iso] {
+                days.append(settled)
+            } else if date < today && isNonWorkingDay(date) {
+                // No punches expected, nothing to fetch.
+                days.append(DayData(date: iso, dmy: Self.dmyString(date), punches: []))
+            } else {
+                return false
+            }
+        }
+        week = WeekData(
+            employeeName: week?.employeeName ?? "",
+            presenceStatus: week?.presenceStatus ?? "",
+            lastPunchDirection: week?.lastPunchDirection ?? "",
+            lastPunchDate: week?.lastPunchDate,
+            weekStart: Self.dateFormatter.ymd(from: start),
+            days: days
+        )
+        isStale = false
+        return true
+    }
+
     /// Re-fetches a single day and patches it into the loaded week, instead of
     /// reloading the whole week after a one-day change (e.g. a backfill).
     private func refreshDay(_ date: Date) async {
@@ -396,6 +485,7 @@ final class AppModel: ObservableObject {
             guard let day = fresh.first, var current = week,
                   let idx = current.days.firstIndex(where: { $0.date == day.date }) else { return }
             current.days[idx] = day
+            recordSettled([day])
             week = current
             isStale = false
             lastWeekRefresh = Date()
@@ -1050,6 +1140,16 @@ private func backfillCore(date: Date, dmy: String, isFuture: Bool) {
         appendLog("No valid punch schedule configured. Open Settings to add punch times.", level: .error)
         return
     }
+    if isNonWorkingDay(date) {
+        appendLog("\(dmy) is a vacation/holiday. Nothing to do.", level: .info)
+        return
+    }
+    if let day = week?.days.first(where: { $0.date == Self.dateFormatter.ymd(from: date) }),
+       !Calendar.current.isDateInToday(date),
+       DayStatus(from: day.punches, isToday: false) == .complete {
+        appendLog("\(dmy) is already complete. Nothing to do.", level: .info)
+        return
+    }
     isBusy = true
     appendLog("Analyzing \(dmy)...")
     Task {
@@ -1062,6 +1162,12 @@ private func backfillCore(date: Date, dmy: String, isFuture: Bool) {
             } else {
                 let portal = try await api.getMyPunches(session, date: dmy)
                 existingWall = portal.map { (PunchFormat.wallTime($0.dateTime), $0.actualType == 1 ? "in" : "out") }
+            }
+            if !Calendar.current.isDateInToday(date),
+               DayStatus(from: existingWall.map { Punch(time: $0.time, type: $0.type) }, isToday: false) == .complete {
+                appendLog("\(dmy) is already complete. Nothing to do.", level: .info)
+                isBusy = false
+                return
             }
             let plans = buildBackfillPlan(for: date, existingWall: existingWall, configs: settings.punchConfigs)
 
@@ -1409,8 +1515,20 @@ func dayCoversConfiguredSchedule(punches: [Punch], configs: [PunchConfig], isTod
         guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]) else { return 0 }
         return h * 60 + m
     }
-    // Only today's slots are gated by "now"; a past day counts every slot as
-    // already arrived.
+    // A past day is finished: it only needs its bookends (first IN near the
+    // first configured slot, last OUT near the last). Lunch punches don't
+    // matter once the day is over, so such a day is complete and never
+    // offered for backfill again.
+    if !isToday, let first = configs.min(by: { mins($0.time) < mins($1.time) }),
+       let last = configs.max(by: { mins($0.time) < mins($1.time) }) {
+        let sorted = punches.sorted { mins($0.time) < mins($1.time) }
+        guard let firstPunch = sorted.first, let lastPunch = sorted.last else { return false }
+        return firstPunch.type == "in" && lastPunch.type == "out"
+            && abs(mins(firstPunch.time) - mins(first.time)) <= punchMatchToleranceMinutes
+            && abs(mins(lastPunch.time) - mins(last.time)) <= punchMatchToleranceMinutes
+    }
+
+    // Only today's slots are gated by "now".
     let nowMins: Int
     if isToday {
         let c = Calendar.current.dateComponents([.hour, .minute], from: Date())

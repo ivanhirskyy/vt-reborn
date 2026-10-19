@@ -7,7 +7,7 @@ struct DayCard: View {
     let onBackfill: () -> Void
 
     private var canBackfill: Bool {
-        !day.isFuture && day.status != .complete && !isBusy && !isLoading
+        !day.isFuture && !day.isNonWorking && day.status != .complete && !isBusy && !isLoading
     }
 
     var body: some View {
