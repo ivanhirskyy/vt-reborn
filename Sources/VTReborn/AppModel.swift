@@ -1317,7 +1317,9 @@ private func backfillCore(date: Date, dmy: String, isFuture: Bool) {
     }
 }
 
-private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, session: Session) async {
+@discardableResult
+private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, session: Session, finishing: Bool = true) async -> Bool {
+    var succeeded = true
     isBusy = true
     appendLog("Submitting \(plans.count) punch(es) for \(dmy)...")
     let isoDate = Self.dateFormatter.ymd(from: date)
@@ -1346,11 +1348,121 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
             invalidateSession()
             appendLog("Backfill failed: \(error.localizedDescription)", level: .error)
         }
+        succeeded = false
     }
-    isBusy = false
+    if finishing { isBusy = false }
     await refreshDay(date)
     pendingPunches[isoDate] = nil
-    await refreshAlerts()
+    if finishing { await refreshAlerts() }
+    return succeeded
+}
+
+// MARK: Backfill all missing days
+
+struct MissingDay {
+    let date: Date
+    let dmy: String
+    let plans: [BackfillPlan]   // only the slots that will be submitted
+}
+
+/// Scans this month's past working days (plus any days the portal flagged) and
+/// backfills what's missing in one pass.
+func backfillMissingDays() {
+    guard !isBusy else { return }
+    guard AppSettings.shared.hasValidPunchConfig else {
+        appendLog("No valid punch schedule configured. Open Settings to add punch times.", level: .error)
+        return
+    }
+    isBusy = true
+    appendLog("Scanning for missing days...")
+    Task {
+        do {
+            let cal = Calendar.current
+            let today = cal.startOfDay(for: Date())
+            // Weekdays of the current month before today, plus portal-flagged days.
+            var candidates = Set<Date>()
+            var d = Self.firstOfMonth(of: today)
+            while d < today {
+                if (2...6).contains(cal.component(.weekday, from: d)) { candidates.insert(d) }
+                d = cal.date(byAdding: .day, value: 1, to: d)!
+            }
+            for alert in alerts {
+                if let ad = alert.backfillDate, cal.startOfDay(for: ad) < today { candidates.insert(cal.startOfDay(for: ad)) }
+            }
+            let dates = candidates.filter { !isNonWorkingDay($0) }.sorted()
+
+            let (session, days) = try await withSession { session in
+                (session, try await fetchDays(session, dates: dates))
+            }
+            recordSettled(days)
+
+            let configs = AppSettings.shared.punchConfigs
+            var missing: [MissingDay] = []
+            for (date, day) in zip(dates, days) where DayStatus(from: day.punches, isToday: false) != .complete {
+                let plans = Self.buildBackfillPlan(
+                    for: date, existingWall: day.punches.map { (time: $0.time, type: $0.type) }, configs: configs)
+                let chosen = plans.filter { $0.preselect && $0.canSubmit }
+                if !chosen.isEmpty { missing.append(MissingDay(date: date, dmy: day.dmy, plans: chosen)) }
+            }
+
+            guard !missing.isEmpty else {
+                appendLog("No missing days found.", level: .success)
+                isBusy = false
+                return
+            }
+            guard let confirmed = await MainActor.run(body: { showMissingDaysPreview(missing) }), !confirmed.isEmpty else {
+                appendLog("Backfill cancelled — nothing was submitted.", level: .info)
+                isBusy = false
+                return
+            }
+            for (i, day) in confirmed.enumerated() {
+                if i > 0 { try await Task.sleep(nanoseconds: 3_000_000_000) }
+                let ok = await executeBackfill(day.plans, date: day.date, dmy: day.dmy, session: session, finishing: false)
+                if !ok { break }
+            }
+            isBusy = false
+            await refreshAlerts()
+        } catch {
+            if isSessionExpiredError(error) {
+                handleSessionExpiry()
+            } else {
+                appendLog("Scan failed: \(error.localizedDescription)", level: .error)
+            }
+            isBusy = false
+        }
+    }
+}
+
+@MainActor
+private func showMissingDaysPreview(_ days: [MissingDay]) -> [MissingDay]? {
+    let alert = NSAlert()
+    alert.messageText = "Backfill \(days.count) missing day(s)"
+    alert.informativeText = "Checked days will be submitted (first IN and last OUT)."
+    alert.addButton(withTitle: "Submit selected")
+    alert.addButton(withTitle: "Cancel")
+
+    let stack = NSStackView()
+    stack.orientation = .vertical
+    stack.alignment = .leading
+    stack.spacing = 4
+    var boxes: [(MissingDay, NSButton)] = []
+    let fmt = DateFormatter()
+    fmt.locale = Locale(identifier: "en_US_POSIX")
+    fmt.dateFormat = "EEE d MMM"
+    for day in days {
+        let slots = day.plans.map { "\($0.direction.uppercased()) \($0.expectedTime)" }.joined(separator: ", ")
+        let cb = NSButton(checkboxWithTitle: "\(fmt.string(from: day.date)) — \(slots)", target: nil, action: nil)
+        cb.state = .on
+        cb.font = .systemFont(ofSize: 11.5)
+        stack.addArrangedSubview(cb)
+        boxes.append((day, cb))
+    }
+    stack.layoutSubtreeIfNeeded()
+    stack.frame = NSRect(origin: .zero, size: stack.fittingSize)
+    alert.accessoryView = stack
+
+    guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+    return boxes.filter { $0.1.state == .on }.map { $0.0 }
 }
 
     // MARK: - Scheduler

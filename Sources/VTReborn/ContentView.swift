@@ -1106,6 +1106,14 @@ struct ContentView: View {
             }
             .help("Go to this week")
 
+            Button {
+                model.backfillMissingDays()
+            } label: {
+                Image(systemName: "calendar.badge.exclamationmark")
+            }
+            .disabled(model.isBusy)
+            .help("Backfill every missing day this month")
+
             if model.isRefreshing {
                 ProgressView()
                     .controlSize(.small)

@@ -152,6 +152,8 @@ private func showPopover() {
         let clockOut = item("Clock Out", "arrow.up.circle", #selector(clockOutAction), enabled: !busy)
         let backfillToday = item("Backfill today…", "arrow.uturn.backward.circle", #selector(backfillTodayAction),
                                  enabled: model.canBackfillToday)
+        let backfillMissing = item("Backfill missing days…", "calendar.badge.exclamationmark", #selector(backfillMissingAction),
+                                   enabled: !busy)
         let scheduler = model.schedulerRunning
             ? item("Stop Scheduler", "stop.circle", #selector(toggleSchedulerAction))
             : item("Start Scheduler", "play.circle", #selector(toggleSchedulerAction))
@@ -171,6 +173,7 @@ private func showPopover() {
         menu.addItem(clockIn)
         menu.addItem(clockOut)
         menu.addItem(backfillToday)
+        menu.addItem(backfillMissing)
         menu.addItem(.separator())
         menu.addItem(scheduler)
         menu.addItem(openWindow)
@@ -184,6 +187,7 @@ private func showPopover() {
     @objc private func clockInAction() { model.punch("in") }
     @objc private func clockOutAction() { model.punch("out") }
     @objc private func backfillTodayAction() { model.backfill(date: Date()) }
+    @objc private func backfillMissingAction() { model.backfillMissingDays() }
     @objc private func openWindowAction() { MainWindowController.shared.show() }
 
     @objc private func toggleSchedulerAction() {
