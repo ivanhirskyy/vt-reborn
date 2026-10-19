@@ -10,6 +10,11 @@ let package = Package(
         .executableTarget(
             name: "VTReborn",
             path: "Sources/VTReborn"
+        ),
+        .testTarget(
+            name: "VTRebornTests",
+            dependencies: ["VTReborn"],
+            path: "Tests/VTRebornTests"
         )
     ]
 )

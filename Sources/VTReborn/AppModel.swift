@@ -154,6 +154,8 @@ final class AppModel: ObservableObject {
     /// Presence reported by the last live punch. The login-time value in the
     /// cached session goes stale as soon as you clock in or out.
     private var livePresence: (status: String, direction: String)?
+    /// Last punch sent from this app, used to refuse duplicates.
+    private var lastLivePunch: (type: String, at: Date)?
     /// A week refreshed this recently is trusted for the backfill preview.
     private static let freshWeekWindow: TimeInterval = 120
 
@@ -575,6 +577,7 @@ final class AppModel: ObservableObject {
                 let session = try await requireSession()
                 let result = try await api.punch(session, direction: direction)
                 livePresence = (result.status, result.direction)
+                lastLivePunch = (direction, Date())
                 appendLog("Clocked \(direction)! Status: \(result.status)", level: .success)
             } catch {
                 if isSessionExpiredError(error) {
@@ -1048,11 +1051,10 @@ struct BackfillPlan: Identifiable {
     var isSelectable: Bool { canSubmit || isProblem }
 }
 
-private func buildBackfillPlan(for date: Date, existingWall: [(time: String, type: String)], configs: [PunchConfig]) -> [BackfillPlan] {
+static func buildBackfillPlan(for date: Date, existingWall: [(time: String, type: String)], configs: [PunchConfig], now: Date = Date()) -> [BackfillPlan] {
     let cal = Calendar.current
-    let isToday = cal.isDateInToday(date)
-    let now = Date()
-    let nowMins = isToday ? hourMinToMins(timeHM(now)) : Int.max  // past days = all due
+    let isToday = cal.isDate(date, inSameDayAs: now)
+    let nowMins = isToday ? minutesOfDay(now) : Int.max  // past days = all due
 
     var usedExisting = Set<Int>()
     var plans: [BackfillPlan] = []
@@ -1128,14 +1130,17 @@ private func buildBackfillPlan(for date: Date, existingWall: [(time: String, typ
     return plans
 }
 
-private func hourMinToMins(_ hm: String) -> Int {
+static func hourMinToMins(_ hm: String) -> Int {
     let parts = hm.split(separator: ":")
     guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]) else { return 0 }
     return h * 60 + m
 }
 
-private func timeHM(_ date: Date) -> String {
-    PunchFormat.timeFormatter.string(from: date)
+/// Minutes since local midnight. (`PunchFormat.timeFormatter` is pinned to UTC
+/// for portal timestamps, so it must not be used for the local "now".)
+static func minutesOfDay(_ date: Date) -> Int {
+    let c = Calendar.current.dateComponents([.hour, .minute], from: date)
+    return (c.hour ?? 0) * 60 + (c.minute ?? 0)
 }
 
 @MainActor
@@ -1246,7 +1251,7 @@ private func backfillCore(date: Date, dmy: String, isFuture: Bool) {
                 isBusy = false
                 return
             }
-            let plans = buildBackfillPlan(for: date, existingWall: existingWall, configs: settings.punchConfigs)
+            let plans = Self.buildBackfillPlan(for: date, existingWall: existingWall, configs: settings.punchConfigs)
 
             let missingCount = plans.filter { $0.canSubmit }.count
             let conflictCount = plans.filter { $0.isProblem }.count
@@ -1323,6 +1328,7 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
             appendLog("No valid punch schedule configured. Open Settings to add punch times.", level: .error)
             return
         }
+        Notifier.requestAuthorization()
         armDayScheduler(punches: settings.punchConfigs)
         schedulerRunning = true
         appendLog(
@@ -1370,7 +1376,7 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
             let fireAt = scheduled.addingTimeInterval(jitterSeconds)
             guard fireAt > now else { continue }
 
-            let timer = Timer(fireAt: fireAt, interval: 0, target: self, selector: #selector(schedulerFire(_:)), userInfo: punch, repeats: false)
+            let timer = Timer(fireAt: fireAt, interval: 0, target: self, selector: #selector(schedulerFire(_:)), userInfo: ScheduledPunch(config: punch, scheduled: scheduled), repeats: false)
             RunLoop.main.add(timer, forMode: .common)
             scheduledTimers.append(timer)
             appendLog("Scheduled \(punch.type.uppercased()) at \(punch.time) (jitter up to \(jitterMinutes) min).", level: .info)
@@ -1383,8 +1389,58 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
         dayReArmTimer = rearm
     }
 
+    /// Timer payload: the configured slot plus its un-jittered time.
+    private final class ScheduledPunch {
+        let config: PunchConfig
+        let scheduled: Date
+        init(config: PunchConfig, scheduled: Date) {
+            self.config = config
+            self.scheduled = scheduled
+        }
+    }
+
+    enum ScheduledPunchDecision: Equatable {
+        case run
+        case skip(String)
+    }
+
+    /// A timer that fires later than this after its slot (jitter included) is
+    /// stale, e.g. the Mac slept through it and woke up hours later.
+    static let scheduledPunchStaleWindow: TimeInterval = 20 * 60
+    /// Same-direction punches closer together than this count as duplicates.
+    static let duplicatePunchWindow: TimeInterval = 10 * 60
+
+    /// Pure decision for whether a scheduled punch may actually go out.
+    static func decideScheduledPunch(
+        type: String, scheduled: Date, now: Date,
+        isNonWorkingDay: Bool, lastPunch: (type: String, at: Date)?
+    ) -> ScheduledPunchDecision {
+        let weekday = Calendar.current.component(.weekday, from: now)
+        if weekday == 1 || weekday == 7 { return .skip("it's the weekend") }
+        if isNonWorkingDay { return .skip("today is a vacation or holiday") }
+        if now.timeIntervalSince(scheduled) > scheduledPunchStaleWindow {
+            return .skip("it fired too late (was the Mac asleep?) — backfill it instead")
+        }
+        if let last = lastPunch, last.type == type, now.timeIntervalSince(last.at) < duplicatePunchWindow {
+            return .skip("a \(type.uppercased()) was already punched a moment ago")
+        }
+        return .run
+    }
+
     @objc private func schedulerFire(_ timer: Timer) {
-        guard let punch = timer.userInfo as? PunchConfig else { return }
+        guard let item = timer.userInfo as? ScheduledPunch else { return }
+        let punch = item.config
+        let decision = Self.decideScheduledPunch(
+            type: punch.type, scheduled: item.scheduled, now: Date(),
+            isNonWorkingDay: isNonWorkingDay(Date()), lastPunch: lastLivePunch)
+        if case .skip(let reason) = decision {
+            appendLog("Skipped scheduled \(punch.type.uppercased()) \(punch.time): \(reason).", level: .info)
+            // Weekends are expected silence; anything else deserves a heads-up.
+            if !reason.contains("weekend") {
+                Notifier.post("VT Reborn skipped a punch", "\(punch.type.uppercased()) \(punch.time): \(reason)")
+            }
+            return
+        }
         appendLog("Executing punch \(punch.type.uppercased())...", level: .info)
         Task { [weak self] in
             await self?.executeScheduledPunch(punch)
@@ -1407,15 +1463,19 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
             let session = try await requireSession()
             let result = try await api.punch(session, direction: punch.type)
             livePresence = (result.status, result.direction)
+            lastLivePunch = (punch.type, Date())
             appendLog("Punch \(punch.type.uppercased()) successful (status: \(result.status))", level: .success)
+            Notifier.post("Clocked \(punch.type.uppercased())", "Scheduled punch for \(punch.time) went through.")
             await refresh()
         } catch {
             if isSessionExpiredError(error) {
                 appendLog("Scheduled punch failed: session expired", level: .error)
+                Notifier.post("Punch failed", "Session expired — open VT Reborn and sign in again.")
                 handleSessionExpiry()
             } else {
                 invalidateSession()
                 appendLog("Scheduled punch error: \(error.localizedDescription)", level: .error)
+                Notifier.post("Punch failed", "\(punch.type.uppercased()) \(punch.time): \(error.localizedDescription)")
             }
         }
     }
@@ -1587,7 +1647,7 @@ let punchMatchToleranceMinutes = 120
 ///  - each punch is consumed at most once)Skip, so a lone early OUT can never
 ///    masquerade as the final OUT and silently hide a missed afternoon.
 /// When no schedule is configured we fall back to "any IN and any OUT".
-func dayCoversConfiguredSchedule(punches: [Punch], configs: [PunchConfig], isToday: Bool = false) -> Bool {
+func dayCoversConfiguredSchedule(punches: [Punch], configs: [PunchConfig], isToday: Bool = false, now: Date = Date()) -> Bool {
     func mins(_ hm: String) -> Int {
         let parts = hm.split(separator: ":")
         guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]) else { return 0 }
@@ -1609,7 +1669,7 @@ func dayCoversConfiguredSchedule(punches: [Punch], configs: [PunchConfig], isTod
     // Only today's slots are gated by "now".
     let nowMins: Int
     if isToday {
-        let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        let c = Calendar.current.dateComponents([.hour, .minute], from: now)
         nowMins = (c.hour ?? 0) * 60 + (c.minute ?? 0)
     } else {
         nowMins = Int.max
