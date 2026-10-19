@@ -21,12 +21,7 @@ struct DayData: Hashable, Codable, Identifiable {
 
     var hasIn: Bool { punches.contains { $0.type == "in" } }
     var hasOut: Bool { punches.contains { $0.type == "out" } }
-    var status: DayStatus {
-        if punches.isEmpty { return .empty }
-        let inCount = punches.filter { $0.type == "in" }.count
-        let outCount = punches.filter { $0.type == "out" }.count
-        return inCount == outCount ? .complete : .partial
-    }
+    var status: DayStatus { DayStatus(from: punches) }
 }
 
 struct WeekData: Codable {
@@ -69,6 +64,7 @@ struct CalendarDayVM: Identifiable {
     let isVacation: Bool
     let shiftName: String?
     let shiftShortName: String?
+    let shiftId: Int?
     let isAbsenceDay: Bool
     let isAbsenceHours: Bool
     let isToday: Bool
@@ -99,6 +95,7 @@ final class AppModel: ObservableObject {
     @Published var loginFeedback: String?
     @Published var loginFeedbackIsError = false
     @Published var isStale = false
+    @Published var sessionExpired = false
     @Published var schedulerRunning = false
     @Published var weekStart: Date
     @Published var selectedTab = 0
@@ -109,6 +106,41 @@ final class AppModel: ObservableObject {
     @Published var alerts: [VTAlert] = []
     @Published var isVacationLoading = false
     @Published var isAlertsLoading = false
+    @Published var isBookingVacation = false
+    @Published var vacationBookingFeedback: String?
+    @Published var vacationBookingFeedbackIsError = false
+    @Published var selectedShiftId: Int?
+    @Published var shiftDataLoadFailed = false
+    /// Available days ("PT Férias" concept, day-based) shown by the portal as
+    /// "Tem à sua disposição X dias para esta aplicação".
+    @Published var availableHolidayDays: Double?
+
+    /// Maximum number of vacation days that can still be booked this year.
+    /// Portal-authoritative number when known; otherwise accrual minus already
+    /// scheduled days.
+    var availableBookableDays: Int? {
+        if let available = availableHolidayDays {
+            return max(Int(available.rounded(.down)), 0)
+        }
+        guard let accrual = accruals.first(where: {
+            $0.name.localizedCaseInsensitiveContains("Férias pendentes")
+                && !$0.name.localizedCaseInsensitiveContains("ano anterior")
+        }) else { return nil }
+        return max(accrual.available - scheduledVacationDaysThisYear, 0)
+    }
+
+    /// Scheduled (already booked) vacation days this year, from today onwards.
+    private var scheduledVacationDaysThisYear: Int {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let thisYear = cal.component(.year, from: today)
+        return vacationDates.reduce(into: 0) { count, date in
+            let d = cal.startOfDay(for: date)
+            if d >= today, cal.component(.year, from: d) == thisYear {
+                count += 1
+            }
+        }
+    }
 
     /// Calendar months already fetched (key = year * 12 + month - 1), so switching
     /// months never triggers a network round-trip.
@@ -162,13 +194,34 @@ final class AppModel: ObservableObject {
         Keychain.delete(key: Self.sessionKeychainKey)
     }
 
-    /// Runs `operation` with a session, re-logging in once after an early failure
-    /// (expired token). Only used for read-only operations — never for punches,
-    /// which must not be retried.
+    /// Returns true when the API signalled that the session is no longer valid
+    /// (e.g. it was stolen by a login elsewhere on the portal).
+    private func isSessionExpiredError(_ error: Error) -> Bool {
+        if case VTAPIError.sessionExpired = error { return true }
+        return false
+    }
+
+    /// Clears the cached session and surfaces a re-login prompt so the user
+    /// knows punches are failing because the session expired — not the network.
+    private func handleSessionExpiry() {
+        sessionExpired = true
+        invalidateSession()
+        appendLog("Session expired — please sign in again", level: .error)
+    }
+
+    func reLogin() {
+        signIn()
+    }
+
+    /// Runs `operation` with a session, re-logging in once when the cached
+    /// token has expired/stolen. Only used for read-only operations — never for
+    /// punches, which must not be retried. Other errors propagate as-is.
     private func withSession<T>(_ operation: (Session) async throws -> T) async throws -> T {
         do {
             return try await operation(try await requireSession())
-        } catch {
+        } catch let error where isSessionExpiredError(error) {
+            appendLog("Session expired — re-logging in...", level: .info)
+            sessionExpired = false
             invalidateSession()
             return try await operation(try await requireSession())
         }
@@ -214,7 +267,7 @@ final class AppModel: ObservableObject {
                 dmy: dmy(date),
                 isToday: cal.isDate(date, inSameDayAs: today),
                 punches: punches,
-                status: DayStatus(from: punches),
+                status: DayStatus(from: punches, isToday: cal.isDate(date, inSameDayAs: today)),
                 isVacation: vacationDates.contains(cal.startOfDay(for: date)),
                 isHoliday: calendarDay?.isHoliday ?? false,
                 isBankHoliday: calendarDay?.isBankHoliday ?? false,
@@ -305,6 +358,9 @@ final class AppModel: ObservableObject {
             Self.saveCachedWeek(fresh)
         } catch {
             appendLog(error.localizedDescription, level: .error)
+            if isSessionExpiredError(error) {
+                handleSessionExpiry()
+            }
             if week != nil {
                 isStale = true
             }
@@ -323,8 +379,13 @@ final class AppModel: ObservableObject {
                 let result = try await api.punch(session, direction: direction)
                 appendLog("Clocked \(direction)! Status: \(result.status)", level: .success)
             } catch {
-                invalidateSession()
-                appendLog("Clock \(direction) failed: \(error.localizedDescription)", level: .error)
+                if isSessionExpiredError(error) {
+                    appendLog("Clock \(direction) failed: session expired", level: .error)
+                    handleSessionExpiry()
+                } else {
+                    invalidateSession()
+                    appendLog("Clock \(direction) failed: \(error.localizedDescription)", level: .error)
+                }
             }
             isBusy = false
             await refresh()
@@ -341,6 +402,7 @@ final class AppModel: ObservableObject {
         Task { @MainActor in
             do {
                 let session = try await loginAndCache()
+                sessionExpired = false
                 loginFeedback = "Signed in — \(session.employeeName) · \(session.presenceStatus)"
                 loginFeedbackIsError = false
                 appendLog("Signed in", level: .success)
@@ -358,6 +420,154 @@ final class AppModel: ObservableObject {
     func clearLoginFeedback() {
         loginFeedback = nil
         loginFeedbackIsError = false
+    }
+
+    func submitVacationRequest(dates: [Date], comments: String) async {
+        guard !isBookingVacation else { return }
+        guard let shiftId = selectedShiftId else {
+            vacationBookingFeedback = "Shift data not loaded yet. Please wait."
+            vacationBookingFeedbackIsError = true
+            return
+        }
+        guard !dates.isEmpty else {
+            vacationBookingFeedback = "No dates selected."
+            vacationBookingFeedbackIsError = true
+            return
+        }
+        if let limit = availableBookableDays {
+            guard dates.count <= limit else {
+                vacationBookingFeedback = "That's \(dates.count) day\(dates.count == 1 ? "" : "s"), but only \(limit) day\(limit == 1 ? "" : "s") are available to book."
+                vacationBookingFeedbackIsError = true
+                return
+            }
+        }
+
+        let cal = Calendar.current
+        let sorted = dates.sorted()
+        let first = cal.startOfDay(for: sorted.first!)
+        guard first >= cal.startOfDay(for: Date()) else {
+            vacationBookingFeedback = "Cannot book dates in the past."
+            vacationBookingFeedbackIsError = true
+            return
+        }
+
+        isBookingVacation = true
+        vacationBookingFeedback = nil
+
+        let strDates = sorted.map { date -> String in
+            let c = cal.dateComponents([.year, .month, .day], from: date)
+            return String(format: "%04d%02d%02d", c.year!, c.month!, c.day!)
+        }.joined(separator: "/")
+
+        appendLog("Submitting vacation request for \(dates.count) day(s)...")
+        do {
+            var result = try await withSession { session in
+                try await api.saveRequestHolidays(
+                    session,
+                    strDates: strDates,
+                    idHolidays: shiftId,
+                    comments: comments,
+                    acceptWarning: false
+                )
+            }
+
+            // Retry with acceptWarning if the first attempt returned a warning status.
+            if let status = result.d.Status, status < 0, let res = result.d.Result, !res {
+                appendLog("Warning received, retrying with confirmation...", level: .info)
+                result = try await withSession { session in
+                    try await api.saveRequestHolidays(
+                        session,
+                        strDates: strDates,
+                        idHolidays: shiftId,
+                        comments: comments,
+                        acceptWarning: true
+                    )
+                }
+            }
+
+            guard let res = result.d.Result, res else {
+                let errorMsg = result.d.StatusErrorMsg ?? "unknown error"
+                throw VTAPIError.message("Rejected (status \(result.d.Status ?? -1)): \(errorMsg)")
+            }
+
+            let requestId = result.d.RequestId ?? 0
+            appendLog("Vacation request submitted (ID: \(requestId)).", level: .success)
+            vacationBookingFeedback = "Request submitted successfully."
+            vacationBookingFeedbackIsError = false
+        } catch {
+            appendLog("Vacation request failed: \(error.localizedDescription)", level: .error)
+            if isSessionExpiredError(error) {
+                handleSessionExpiry()
+            }
+            vacationBookingFeedback = "Failed: \(error.localizedDescription)"
+            vacationBookingFeedbackIsError = true
+        }
+        isBookingVacation = false
+        await refreshVacation()
+    }
+
+    /// Looks up the *vacation* concept shift (e.g. "PT Férias" → 947) from the
+    /// `plannedholiday` generic list. This is the shift the portal uses for
+    /// `GetRequestAvailableHolidaysDays` and `SaveRequestHolidays` — NOT the
+    /// work shift from the calendar (which returns 0 available days).
+    func refreshVacationShift() async {
+        do {
+            let options = try await withSession { session in
+                try await api.getGenericList(session, requestType: "plannedholiday")
+            }
+            // Prefer shift-based concepts (RelatedInfo "S" = full days).
+            let shiftBased = options.filter { $0.RelatedInfo == "S" }
+            guard let concept = shiftBased.first, let shift = concept.intValue else {
+                appendLog("No shift-based vacation concept found in plannedholiday list.", level: .info)
+                selectedShiftId = nil
+                return
+            }
+            selectedShiftId = shift
+            await fetchAvailableHolidaysDays()
+        } catch {
+            appendLog("Failed to load vacation shift: \(error.localizedDescription)", level: .error)
+            if isSessionExpiredError(error) {
+                handleSessionExpiry()
+            }
+        }
+    }
+
+    /// Reads the days (or hours) the portal says are available to book for the
+    /// user's vacation concept, e.g. `AvailableDaysOrTime: "1.000"`.
+    func fetchAvailableHolidaysDays() async {
+        guard let shiftId = selectedShiftId else { return }
+        do {
+            let result = try await withSession { session in
+                try await api.getRequestAvailableHolidaysDays(
+                    session,
+                    employeeId: session.employeeId,
+                    shiftId: shiftId
+                )
+            }
+            if let days = result.days {
+                availableHolidayDays = days
+                appendLog("Available holidays: \(Self.formatAvailableDays(days)) day(s) for shift \(shiftId).", level: .info)
+            } else if let hours = result.hours {
+                availableHolidayDays = 0
+                appendLog("Available holidays: \(hours) (hour-based) for shift \(shiftId).", level: .info)
+            } else {
+                availableHolidayDays = 0
+                appendLog("Available holidays: no value for shift \(shiftId).", level: .info)
+            }
+        } catch {
+            appendLog("Failed to fetch available holidays: \(error.localizedDescription)", level: .error)
+            if isSessionExpiredError(error) {
+                handleSessionExpiry()
+            }
+        }
+    }
+
+    static func formatAvailableDays(_ days: Double) -> String {
+        let rounded = days.rounded()
+        if abs(days - rounded) < 0.0001 {
+            return String(format: "%.0f", rounded)
+        }
+        return String(format: "%.2f", days)
     }
 
     // MARK: - Vacation / Alerts
@@ -388,7 +598,7 @@ final class AppModel: ObservableObject {
                 return CalendarDayVM(
                     id: index, date: calendarMonthStart, dayNumber: 0, weekday: "",
                     isHoliday: false, isBankHoliday: false, holidayDescription: "", isVacation: false,
-                    shiftName: nil, shiftShortName: nil,
+                    shiftName: nil, shiftShortName: nil, shiftId: nil,
                     isAbsenceDay: false, isAbsenceHours: false, isToday: false
                 )
             }
@@ -405,6 +615,7 @@ final class AppModel: ObservableObject {
                 isVacation: vacationDates.contains(cal.startOfDay(for: date)),
                 shiftName: day?.shiftName,
                 shiftShortName: day?.shiftShortName,
+                shiftId: day?.shiftId,
                 isAbsenceDay: day?.isAbsenceDay ?? false,
                 isAbsenceHours: day?.isAbsenceHours ?? false,
                 isToday: cal.isDate(date, inSameDayAs: today)
@@ -415,6 +626,7 @@ final class AppModel: ObservableObject {
     func refreshVacation() async {
         guard !isVacationLoading else { return }
         isVacationLoading = true
+        shiftDataLoadFailed = false
         defer { isVacationLoading = false }
         do {
             let dateString = Self.dmyString(calendarMonthStart)
@@ -427,8 +639,17 @@ final class AppModel: ObservableObject {
             self.accruals = accruals
             self.mergeCalendarDays(days)
             self.vacationDates = Self.parseVacationDates(from: requests)
+            self.selectedShiftId = nil
+            await self.refreshVacationShift()
+            if self.selectedShiftId == nil {
+                shiftDataLoadFailed = true
+            }
         } catch {
             appendLog("Vacation refresh failed: \(error.localizedDescription)", level: .error)
+            shiftDataLoadFailed = true
+            if isSessionExpiredError(error) {
+                handleSessionExpiry()
+            }
         }
     }
 
@@ -447,7 +668,10 @@ final class AppModel: ObservableObject {
     }
 
     /// Fetches the calendar for the given month starts (skipping months already
-    /// fetched) and returns only the newly retrieved days.
+    /// fetched) and returns only the newly retrieved days. Partial failures are
+    /// tolerated (empty arrays for failed months) but the month is not cached so
+    /// future refreshes can retry. Session-expired errors propagate so
+    /// `withSession` can re-login.
     private func fetchCalendarMonths(_ session: Session, months: [Date]) async throws -> [CalendarDayData] {
         var fetched: [CalendarDayData] = []
         try await withThrowingTaskGroup(of: (Int, [CalendarDayData]).self) { group in
@@ -458,8 +682,10 @@ final class AppModel: ObservableObject {
                     do {
                         let days = try await api.getMyCalendar(session, selectedDate: Self.dmyString(monthStart))
                         return (key, days)
+                    } catch let error as VTAPIError {
+                        throw error  // propagate sessionExpired etc.
                     } catch {
-                        return (key, [])
+                        return (key, [])  // network/decode errors → retryable
                     }
                 }
             }
@@ -468,6 +694,8 @@ final class AppModel: ObservableObject {
                     fetched.append(contentsOf: days)
                     calendarFetchedMonths.insert(key)
                 }
+                // Empty arrays leave the key OUT of calendarFetchedMonths,
+                // so a future refresh will retry this month.
             }
         }
         return fetched
@@ -525,6 +753,9 @@ final class AppModel: ObservableObject {
             self.alerts = alerts
         } catch {
             appendLog("Alerts refresh failed: \(error.localizedDescription)", level: .error)
+            if isSessionExpiredError(error) {
+                handleSessionExpiry()
+            }
         }
     }
 
@@ -557,6 +788,7 @@ struct BackfillPlan: Identifiable {
     var existingPunch: Punch?
     let isSubmittable: Bool     // only first IN + last OUT for portal justification
     let isDueNow: Bool          // time has passed (or past day)
+    var preselect = false       // default checkbox state in the preview
 
     enum Status {
         case missing     // no punch near this time
@@ -564,18 +796,25 @@ struct BackfillPlan: Identifiable {
         case conflict    // existing punch nearby but different type
     }
 
-    var display: String {
-        let prefix = isSubmittable ? "" : "ℹ️ "
-        let timeStatus = isSubmittable ? (isDueNow ? "⬜ Will submit now" : "⏳ Pending (after \(expectedTime))") : "⏭️ Skipped (not needed for justification)"
+    var timeLabel: String { "\(expectedTime) \(direction.uppercased())" }
+
+    var detailText: String {
         switch status {
-        case .missing:   return "\(prefix)\(timeStatus) \(direction.uppercased()) at \(expectedTime)"
-        case .covered:   return "\(prefix)✅ \(direction.uppercased()) at \(expectedTime) already exists"
-        case .conflict:  return "\(prefix)⚠️ Conflict at \(expectedTime): \(existingPunch?.type.uppercased() ?? "?") exists, would submit \(direction.uppercased())"
+        case .missing:
+            guard isSubmittable else { return "not needed" }
+            return isDueNow ? "due now" : "not due yet"
+        case .covered:
+            return "recorded"
+        case .conflict:
+            return isSubmittable ? "conflict" : "conflict, not needed"
         }
     }
 
     var canSubmit: Bool { isSubmittable && status == .missing && isDueNow }
     var isProblem: Bool { isSubmittable && status == .conflict }
+
+    /// Only these rows get a live checkbox; the rest are shown as fixed state.
+    var isSelectable: Bool { canSubmit || isProblem }
 }
 
 private func buildBackfillPlan(for date: Date, existing: [EmployeePunch], configs: [PunchConfig]) -> [BackfillPlan] {
@@ -593,46 +832,76 @@ private func buildBackfillPlan(for date: Date, existing: [EmployeePunch], config
         return (hm, dir)
     }
 
-    // Match each config to nearest existing punch (within 30 min)
     var usedExisting = Set<Int>()
     var plans: [BackfillPlan] = []
 
-    // Only first (in) and last (out) are submittable for "forgot to punch" justification
-    let firstIdx = configs.firstIndex { $0.type == "in" } ?? 0
-    let lastIdx = configs.lastIndex { $0.type == "out" } ?? (configs.count - 1)
-    let submittable = Set([firstIdx, lastIdx])
-
+    // Every configured slot is now submittable as a "forgot to punch" backfill.
+    // "Due now" (the expected time has already passed) is what actually gates
+    // the checkbox, so a future slot (e.g. the 16:00 OUT before it's reached)
+    // stays unselectable instead of being offered too early.
     for (configIdx, config) in configs.enumerated() {
         let expected = config.time
         let expectedMins = hourMinToMins(expected)
-        let isSubmittable = submittable.contains(configIdx)
+        let isSubmittable = true
         let isDueNow = isSubmittable && expectedMins <= nowMins
 
         var bestIdx: Int?
-        var bestDiff = 30
 
-        for (i, ex) in existingWall.enumerated() {
-            if usedExisting.contains(i) { continue }
-            let exMins = hourMinToMins(ex.time)
-            let diff = abs(exMins - expectedMins)
-            if diff < bestDiff {
-                bestDiff = diff
-                bestIdx = i
+        if isSubmittable {
+            // Nearest unused punch of the same type, bounded only by this
+            // slot's own tolerance. Because a punch can satisfy at most one
+            // slot (usedExisting) and every slot carries its own expected
+            // time, a lunch "OUT" (e.g. 12:07) can never satisfy the
+            // end-of-day "OUT" (16:00) -- 12:07 falls ~240 minutes short,
+            // outside the 120-minute tolerance -- so a genuinely missed
+            // afternoon stays due. Conversely a missed 13:00 IN with no
+            // near punch stays "missing" and is offered for backfill.
+            var bestDiff = Int.max
+            for (i, ex) in existingWall.enumerated() where !usedExisting.contains(i) && ex.type == config.type {
+                let exMins = hourMinToMins(ex.time)
+                guard abs(exMins - expectedMins) <= punchMatchToleranceMinutes else { continue }
+                let diff = abs(exMins - expectedMins)
+                if diff < bestDiff {
+                    bestDiff = diff
+                    bestIdx = i
+                }
+            }
+        }
+
+        if bestIdx == nil {
+            // Nearby-match search: used for lunch punches (informational only),
+            // and as a conflict fallback for bookends with no same-type match.
+            var bestDiff = 30
+            for (i, ex) in existingWall.enumerated() where !usedExisting.contains(i) {
+                let diff = abs(hourMinToMins(ex.time) - expectedMins)
+                if diff <= bestDiff {
+                    bestDiff = diff
+                    bestIdx = i
+                }
             }
         }
 
         if let idx = bestIdx {
             let ex = existingWall[idx]
             usedExisting.insert(idx)
-            if ex.type == config.type {
-                plans.append(BackfillPlan(expectedTime: expected, direction: config.type, status: .covered, existingPunch: Punch(time: ex.time, type: ex.type), isSubmittable: isSubmittable, isDueNow: isDueNow))
-            } else {
-                plans.append(BackfillPlan(expectedTime: expected, direction: config.type, status: .conflict, existingPunch: Punch(time: ex.time, type: ex.type), isSubmittable: isSubmittable, isDueNow: isDueNow))
-            }
+            let status: BackfillPlan.Status = ex.type == config.type ? .covered : .conflict
+            plans.append(BackfillPlan(expectedTime: expected, direction: config.type, status: status, existingPunch: Punch(time: ex.time, type: ex.type), isSubmittable: isSubmittable, isDueNow: isDueNow))
         } else {
-            let status: BackfillPlan.Status = isSubmittable ? .missing : .covered
-            plans.append(BackfillPlan(expectedTime: expected, direction: config.type, status: status, existingPunch: nil, isSubmittable: isSubmittable, isDueNow: isDueNow))
+            plans.append(BackfillPlan(expectedTime: expected, direction: config.type, status: .missing, existingPunch: nil, isSubmittable: isSubmittable, isDueNow: isDueNow))
         }
+    }
+
+    // Pre-selection is time-aware. Mid-day, tick every slot that is already due
+    // (e.g. at 14:00: 07:30 IN, 12:00 OUT, 13:00 IN; the 16:30 OUT stays
+    // disabled until it passes). Once the whole schedule has elapsed (end of day
+    // or a past day) only the first IN and last OUT are ticked; lunch punches
+    // stay available but unticked.
+    let dayEnded = !plans.isEmpty && plans.allSatisfy { $0.isDueNow }
+    let times = plans.map { hourMinToMins($0.expectedTime) }
+    let firstIdx = times.indices.min { times[$0] < times[$1] }
+    let lastIdx = times.indices.max { times[$0] < times[$1] }
+    for i in plans.indices where plans[i].canSubmit {
+        plans[i].preselect = !dayEnded || i == firstIdx || i == lastIdx
     }
     return plans
 }
@@ -648,51 +917,56 @@ private func timeHM(_ date: Date) -> String {
 }
 
 @MainActor
-private func showBackfillPreview(_ plans: [BackfillPlan], date: Date, dmy: String, onConfirm: @escaping ([BackfillPlan]) -> Void) {
+private func showBackfillPreview(_ plans: [BackfillPlan], date: Date, dmy: String) -> [BackfillPlan]? {
     let alert = NSAlert()
-    alert.messageText = "Backfill plan for \(dmy)"
-    alert.informativeText = plans.map { $0.display }.joined(separator: "\n")
-    let submitBtn = plans.contains { $0.canSubmit } ? "Submit due now" : "Nothing due yet"
-    alert.addButton(withTitle: submitBtn)
+    alert.messageText = "Backfill \(dmy)"
+    alert.informativeText = "Checked rows will be submitted."
+    let hasSelectable = plans.contains { $0.isSelectable }
+    alert.addButton(withTitle: hasSelectable ? "Submit selected" : "Nothing to do")
     alert.addButton(withTitle: "Cancel")
     alert.alertStyle = .informational
 
-    // Add checkboxes for conflicts
-    let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 450, height: 120))
+    let rowWidth: CGFloat = 260
     let stack = NSStackView()
     stack.orientation = .vertical
+    stack.alignment = .leading
     stack.spacing = 4
     stack.translatesAutoresizingMaskIntoConstraints = false
-    accessory.addSubview(stack)
-    NSLayoutConstraint.activate([
-        stack.leadingAnchor.constraint(equalTo: accessory.leadingAnchor),
-        stack.trailingAnchor.constraint(equalTo: accessory.trailingAnchor),
-        stack.topAnchor.constraint(equalTo: accessory.topAnchor),
-        stack.bottomAnchor.constraint(equalTo: accessory.bottomAnchor)
-    ])
 
-    var conflictCheckboxes: [(BackfillPlan, NSButton)] = []
-    for plan in plans where plan.isProblem {
-        let cb = NSButton(checkboxWithTitle: "Force submit \(plan.direction.uppercased()) at \(plan.expectedTime) despite conflict", target: nil, action: nil)
-        cb.state = .off
+    var checkboxes: [(BackfillPlan, NSButton)] = []
+
+    for plan in plans {
+        let title = "\(plan.timeLabel) — \(plan.detailText)"
+        let cb = NSButton(checkboxWithTitle: title, target: nil, action: nil)
+        cb.font = .systemFont(ofSize: 11.5)
+        cb.widthAnchor.constraint(equalToConstant: rowWidth).isActive = true
+
+        if plan.isSelectable {
+            cb.state = plan.preselect ? .on : .off
+        } else {
+            cb.state = (plan.status == .covered) ? .on : .off  // fixed state, just reflects reality
+            cb.isEnabled = false
+        }
+
         stack.addArrangedSubview(cb)
-        conflictCheckboxes.append((plan, cb))
+        checkboxes.append((plan, cb))
     }
 
-    if !conflictCheckboxes.isEmpty {
-        alert.accessoryView = accessory
-    }
+    // NSAlert reads accessoryView.frame before Auto Layout gets a pass, so a
+    // stray zero-height frame here would overlap the informative text instead
+    // of reserving space for it — force layout and size the frame explicitly.
+    stack.layoutSubtreeIfNeeded()
+    stack.frame = NSRect(origin: .zero, size: stack.fittingSize)
+    alert.accessoryView = stack
 
     let response = alert.runModal()
     if response == .alertFirstButtonReturn {
-        var toSubmit = plans.filter { $0.canSubmit }
-        for (plan, cb) in conflictCheckboxes {
-            if cb.state == .on { toSubmit.append(plan) }
-        }
+        let toSubmit = checkboxes.filter { $0.1.isEnabled && $0.1.state == .on }.map { $0.0 }
         if !toSubmit.isEmpty {
-            onConfirm(toSubmit)
+            return toSubmit
         }
     }
+    return nil
 }
 
 func backfill(_ day: DayVM) {
@@ -731,14 +1005,22 @@ private func backfillCore(date: Date, dmy: String, isFuture: Bool) {
                 return
             }
 
-            await MainActor.run {
-                showBackfillPreview(plans, date: date, dmy: dmy) { confirmed in
-                    Task { await self.executeBackfill(confirmed, date: date, dmy: dmy, session: session) }
-                }
+            let confirmed = await MainActor.run { showBackfillPreview(plans, date: date, dmy: dmy) }
+
+            if let confirmed, !confirmed.isEmpty {
+                await executeBackfill(confirmed, date: date, dmy: dmy, session: session)
+            } else {
+                appendLog("Backfill cancelled — nothing was submitted.", level: .info)
+                isBusy = false
             }
         } catch {
-            invalidateSession()
-            appendLog("Backfill failed: \(error.localizedDescription)", level: .error)
+            if isSessionExpiredError(error) {
+                appendLog("Backfill failed: session expired", level: .error)
+                handleSessionExpiry()
+            } else {
+                invalidateSession()
+                appendLog("Backfill failed: \(error.localizedDescription)", level: .error)
+            }
             isBusy = false
         }
     }
@@ -748,11 +1030,11 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
     isBusy = true
     appendLog("Submitting \(plans.count) punch(es) for \(dmy)...")
     do {
-        let delayNs: UInt64 = 4_000_000_000
+        let delayNs: UInt64 = 3_000_000_000
         let isoDate = Self.dateFormatter.ymd(from: date)
         for (i, plan) in plans.enumerated() {
             if i > 0 {
-                appendLog("waiting 4s...", level: .info)
+                appendLog("waiting 3s...", level: .info)
                 try await Task.sleep(nanoseconds: delayNs)
             }
             let punchDateTime = "\(isoDate) \(plan.expectedTime)"
@@ -763,8 +1045,13 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
         appendLog("Done! All punches submitted for \(dmy).", level: .success)
         AppSettings.shared.handledPunchDates.insert(Self.dateFormatter.ymd(from: date))
     } catch {
-        invalidateSession()
-        appendLog("Backfill failed: \(error.localizedDescription)", level: .error)
+        if isSessionExpiredError(error) {
+            appendLog("Backfill failed: session expired", level: .error)
+            handleSessionExpiry()
+        } else {
+            invalidateSession()
+            appendLog("Backfill failed: \(error.localizedDescription)", level: .error)
+        }
     }
     isBusy = false
     await refresh()
@@ -869,8 +1156,13 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
             appendLog("Punch \(punch.type.uppercased()) successful (status: \(result.status))", level: .success)
             await refresh()
         } catch {
-            invalidateSession()
-            appendLog("Scheduled punch error: \(error.localizedDescription)", level: .error)
+            if isSessionExpiredError(error) {
+                appendLog("Scheduled punch failed: session expired", level: .error)
+                handleSessionExpiry()
+            } else {
+                invalidateSession()
+                appendLog("Scheduled punch error: \(error.localizedDescription)", level: .error)
+            }
         }
     }
 
@@ -1005,15 +1297,76 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
 }
 
 extension DayStatus {
-    init(from punches: [Punch]) {
+    init(from punches: [Punch], configs: [PunchConfig] = AppSettings.shared.punchConfigs, isToday: Bool = false) {
         if punches.isEmpty {
             self = .empty
         } else {
-            let inCount = punches.filter { $0.type == "in" }.count
-            let outCount = punches.filter { $0.type == "out" }.count
-            self = inCount == outCount ? .complete : .partial
+            // "Complete" is schedule-aware *and* due-aware: a day only counts as
+            // done when its punches cover every configured slot that is required
+            // right now. A future slot (e.g. the 16:30 OUT before it's reached
+            // at 13:19) is not yet required, so it can't flip a finished morning
+            // to "partial" and light the backfill button early. Conversely a
+            // genuinely missed 13:00 IN (already due) keeps the day on "partial"
+            // so the afternoon can still be backfilled instead of being silently
+            // marked "Done".
+            self = dayCoversConfiguredSchedule(punches: punches, configs: configs, isToday: isToday) ? .complete : .partial
         }
     }
+}
+
+/// A punch within this many minutes of its configured slot counts as covering it.
+let punchMatchToleranceMinutes = 120
+
+/// True when the day's punches plausibly cover the whole configured schedule,
+/// checked **per configured slot** and **due-aware**: a slot only counts as
+/// required once its expected time has arrived. This mirrors exactly how
+/// `buildBackfillPlan` decides which slots are eligible, so "Complete" and the
+/// backfill button can never disagree about which slots still matter.
+///
+/// Concretely:
+///  - a future slot (e.g. the 16:30 OUT reached at 13:19) is *not* required
+///    yet, so a finished 07:30/12:00/13:00 morning stays "Complete" and the
+///    button stays off;
+///  - a genuinely missed, already-due slot (e.g. a 13:00 IN at 14:30) flips
+///    the day back to "Partial" so it can still be backfilled instead of
+///    being silently marked done;
+///  - each punch is consumed at most once)Skip, so a lone early OUT can never
+///    masquerade as the final OUT and silently hide a missed afternoon.
+/// When no schedule is configured we fall back to "any IN and any OUT".
+func dayCoversConfiguredSchedule(punches: [Punch], configs: [PunchConfig], isToday: Bool = false) -> Bool {
+    func mins(_ hm: String) -> Int {
+        let parts = hm.split(separator: ":")
+        guard parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]) else { return 0 }
+        return h * 60 + m
+    }
+    // Only today's slots are gated by "now"; a past day counts every slot as
+    // already arrived.
+    let nowMins: Int
+    if isToday {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        nowMins = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+    } else {
+        nowMins = Int.max
+    }
+
+    var usedPunchIndices = Set<Int>()
+    for config in configs {
+        let expectedMins = mins(config.time)
+        guard expectedMins <= nowMins else { continue } // not due yet, skip
+
+        // The slot is required now: find a matching-type unused punch within
+        // tolerance. A punch of the other type is never acceptable.
+        var best: (index: Int, diff: Int)?
+        for (i, punch) in punches.enumerated() where !usedPunchIndices.contains(i) && punch.type == config.type {
+            let diff = abs(mins(punch.time) - expectedMins)
+            if diff <= punchMatchToleranceMinutes && (best == nil || diff < best!.diff) {
+                best = (i, diff)
+            }
+        }
+        guard let match = best else { return false } // a due slot is uncovered
+        usedPunchIndices.insert(match.index)
+    }
+    return true
 }
 
 extension DateFormatter {

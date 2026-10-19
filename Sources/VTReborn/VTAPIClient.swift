@@ -24,10 +24,13 @@ struct Session: Codable {
 
 enum VTAPIError: Error, LocalizedError {
     case message(String)
+    case sessionExpired
 
     var errorDescription: String? {
-        if case .message(let m) = self { return m }
-        return nil
+        switch self {
+        case .message(let m): return m
+        case .sessionExpired: return "Session expired — please log in again"
+        }
     }
 }
 
@@ -112,6 +115,15 @@ struct HolidayAccrual: Codable, Identifiable, Equatable {
     var isMeaningful: Bool {
         available > 0 || done > 0 || pending > 0 || prevision > 0 || lasting > 0
     }
+
+    /// A concise, human-friendly label for the raw (often Portuguese) accrual
+    /// name coming from the portal. The original name stays available via `name`.
+    var displayName: String {
+        let lower = name.lowercased()
+        if lower.contains("ano anterior") { return "Carry-over leave" }
+        if lower.contains("férias") || lower.contains("ferias") { return "Vacation leave" }
+        return name
+    }
 }
 
 struct GetAccrualsSummaryResponse: Decodable {
@@ -145,6 +157,7 @@ struct CalendarDayData: Identifiable {
     let isVacation: Bool
     let shiftName: String?
     let shiftShortName: String?
+    let shiftId: Int?
     let isAbsenceDay: Bool
     let isAbsenceHours: Bool
     let unexpectedlyAbsent: Bool
@@ -161,6 +174,7 @@ struct GetMyCalendarResponse: Decodable {
                     let UnexpectedlyAbsent: Bool?
                 }
                 struct Shift: Decodable {
+                    let ID: Int?
                     let Name: String?
                     let ShortName: String?
                 }
@@ -207,6 +221,69 @@ struct GetMyRequestsResponse: Decodable {
         let Requests: [VacationRequest]?
     }
     let d: D
+}
+
+// MARK: - SaveRequestHolidays (booking)
+
+struct SaveRequestHolidaysResponse: Decodable {
+    struct D: Decodable {
+        let Result: Bool?
+        let RequestId: Int?
+        let Status: Int?
+        let StatusErrorMsg: String?
+        let StatusInfoMsg: String?
+    }
+    let d: D
+}
+
+// MARK: - GetRequestAvailableHolidaysDays
+
+struct AvailableHolidayDay: Decodable {
+    let Date: String?
+    let Available: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case Date
+        case Available
+    }
+}
+
+/// Matches the real portal response for GetRequestAvailableHolidaysDays:
+/// `d.Value.AvailableDaysOrTime` (a number of days, e.g. "1.000", or a
+/// duration "00:00" for hour-based concepts) plus `d.Value.IDConceptBalance`.
+struct GetRequestAvailableHolidaysDaysResponse: Decodable {
+    struct D: Decodable {
+        struct Value: Decodable {
+            let AvailableDaysOrTime: String?
+            let IDConceptBalance: Int?
+        }
+        let Value: Value?
+        let Status: Int?
+    }
+    let d: D
+}
+
+struct GenericListResponse: Decodable {
+    struct D: Decodable {
+        let SelectFields: [GenericListOption]?
+        let Status: Int?
+    }
+    let d: D
+}
+
+/// A single option returned by `GetGenericList`. `RelatedInfo` is "S" for
+/// shift-based concepts (full days) and "C" for cause-based concepts
+/// (hour-based / half days); "employees.fullList", "documents", etc. are used
+/// for other dropdown lists.
+struct GenericListOption: Decodable {
+    let FieldName: String?
+    let FieldValue: String?
+    let RelatedInfo: String?
+
+    var intValue: Int? {
+        guard let raw = FieldValue else { return nil }
+        return Int(raw)
+    }
 }
 
 // MARK: - Notifications
@@ -355,6 +432,7 @@ struct VTAPIClient {
         setAuthHeaders(&request, session: session)
 
         let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw VTAPIError.message("Punch failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
         }
@@ -387,6 +465,7 @@ struct VTAPIClient {
         setAuthHeaders(&request, session: session)
 
         let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw VTAPIError.message("GetMyPunches failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
         }
@@ -451,6 +530,7 @@ struct VTAPIClient {
         request.httpBody = body.query?.data(using: .utf8)
 
         let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw VTAPIError.message("SaveForbiddenPunch failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
         }
@@ -474,6 +554,7 @@ struct VTAPIClient {
         setAuthHeaders(&request, session: session)
 
         let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw VTAPIError.message("GetAccrualsSummary failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
         }
@@ -508,6 +589,7 @@ struct VTAPIClient {
         setAuthHeaders(&request, session: session)
 
         let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw VTAPIError.message("GetMyCalendar failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
         }
@@ -557,6 +639,7 @@ struct VTAPIClient {
                 isVacation: isVacation,
                 shiftName: shiftName,
                 shiftShortName: day.ShiftUsed?.ShortName ?? day.MainShift?.ShortName,
+                shiftId: day.ShiftUsed?.ID ?? day.MainShift?.ID,
                 isAbsenceDay: day.Alerts?.OnAbsenceDays ?? false,
                 isAbsenceHours: day.Alerts?.OnAbsenceHours ?? false,
                 unexpectedlyAbsent: day.Alerts?.UnexpectedlyAbsent ?? false
@@ -579,6 +662,7 @@ struct VTAPIClient {
         setAuthHeaders(&request, session: session)
 
         let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw VTAPIError.message("GetUserNotifications failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
         }
@@ -628,6 +712,7 @@ struct VTAPIClient {
         setAuthHeaders(&request, session: session)
 
         let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw VTAPIError.message("GetMyRequests failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
         }
@@ -636,7 +721,128 @@ struct VTAPIClient {
         return decoded.d.Requests ?? []
     }
 
+    // MARK: SaveRequestHolidays (book vacation)
+
+    func saveRequestHolidays(
+        _ session: Session,
+        strDates: String,
+        idHolidays: Int,
+        comments: String,
+        acceptWarning: Bool
+    ) async throws -> SaveRequestHolidaysResponse {
+        let boundary = "WebKitFormBoundary\(UUID().uuidString.prefix(16))"
+        var body = Data()
+
+        func appendField(_ name: String, _ value: String) {
+            body.append(Data("--\(boundary)\r\n".utf8))
+            body.append(Data("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n".utf8))
+            body.append(Data("\(value)\r\n".utf8))
+        }
+
+        appendField("strDates", strDates)
+        appendField("idHolidays", "\(idHolidays)")
+        appendField("comments", comments)
+        appendField("acceptWarning", acceptWarning ? "true" : "false")
+        body.append(Data("--\(boundary)--\r\n".utf8))
+
+        var request = URLRequest(url: URL(string: "\(PORTAL_URL)/SaveRequestHolidays")!)
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        setAuthHeaders(&request, session: session)
+        request.httpBody = body
+
+        let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw VTAPIError.message("SaveRequestHolidays failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+        }
+
+        return try JSONDecoder().decode(SaveRequestHolidaysResponse.self, from: data)
+    }
+
+    // MARK: GetRequestAvailableHolidaysDays
+
+    /// Available vacation days (or hours) for the given shift, parsed from the
+    /// portal's `AvailableDaysOrTime` value. Day-based values like "1.000" are
+    /// returned in `days`; hour-based values like "00:00" are returned in `hours`.
+    func getRequestAvailableHolidaysDays(
+        _ session: Session,
+        employeeId: Int,
+        shiftId: Int
+    ) async throws -> (days: Double?, hours: String?) {
+        var comps = URLComponents(string: "\(PORTAL_URL)/GetRequestAvailableHolidaysDays")!
+        comps.queryItems = [
+            URLQueryItem(name: "IDEmployee", value: "\(employeeId)"),
+            URLQueryItem(name: "IDShift", value: "\(shiftId)"),
+            URLQueryItem(name: "timestamp", value: "0"),
+            URLQueryItem(name: "_", value: String(Int(Date().timeIntervalSince1970 * 1000))),
+        ]
+
+        var request = URLRequest(url: comps.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        setAuthHeaders(&request, session: session)
+
+        let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw VTAPIError.message("GetRequestAvailableHolidaysDays failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+        }
+
+        let decoded = try JSONDecoder().decode(GetRequestAvailableHolidaysDaysResponse.self, from: data)
+        guard let raw = decoded.d.Value?.AvailableDaysOrTime, !raw.isEmpty else {
+            return (nil, nil)
+        }
+        if raw.contains(":") {
+            return (nil, raw)
+        }
+        let normalized = raw.replacingOccurrences(of: ",", with: ".")
+        return (Double(normalized), nil)
+    }
+
+    /// Fetches the list of selectable options for a dropdown. The vacation
+    /// booking view passes `requestType: "plannedholiday"` and returns the
+    /// concept shifts (e.g. "PT Férias" → FieldValue 947, RelatedInfo "S").
+    func getGenericList(_ session: Session, requestType: String) async throws -> [GenericListOption] {
+        var comps = URLComponents(string: "\(PORTAL_URL)/GetGenericList")!
+        comps.queryItems = [
+            URLQueryItem(name: "requestType", value: requestType),
+            URLQueryItem(name: "timestamp", value: "0"),
+            URLQueryItem(name: "_", value: String(Int(Date().timeIntervalSince1970 * 1000))),
+        ]
+
+        var request = URLRequest(url: comps.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        setAuthHeaders(&request, session: session)
+
+        let (data, response) = try await httpSession.data(for: request)
+        try checkAuthenticated(response, data)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw VTAPIError.message("GetGenericList failed: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+        }
+
+        let decoded = try JSONDecoder().decode(GenericListResponse.self, from: data)
+        return decoded.d.SelectFields ?? []
+    }
+
     // MARK: Helpers
+
+    /// Throws `.sessionExpired` when the portal signals this token is no longer valid.
+    /// Two signals exist: HTTP 401/403, or (for every authenticated endpoint) a body
+    /// with `d.Status == -74` — the sentinel returned when the session was stolen by
+    /// a login elsewhere (e.g. on the phone).
+    private func checkAuthenticated(_ response: URLResponse?, _ data: Data) throws {
+        if let http = response as? HTTPURLResponse,
+           http.statusCode == 401 || http.statusCode == 403 {
+            throw VTAPIError.sessionExpired
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let d = json["d"] as? [String: Any],
+              d["Status"] as? Int == -74 else { return }
+        throw VTAPIError.sessionExpired
+    }
 
     private func setAuthHeaders(_ request: inout URLRequest, session: Session) {
         request.setValue(session.guid, forHTTPHeaderField: "roAuth")

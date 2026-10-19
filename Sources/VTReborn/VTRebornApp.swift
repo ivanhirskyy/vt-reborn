@@ -43,6 +43,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--api-test") {
             Task { await runAPITest() }
         }
+
+        if CommandLine.arguments.contains("--session-test") {
+            Task { await runSessionTest() }
+        }
+    }
+
+    /// Dev hook: steal our own session with a second login, then verify a stale
+    /// token is detected as `.sessionExpired` while a fresh one still works.
+    private func runSessionTest() async {
+        let client = VTAPIClient()
+        func line(_ s: String) { print(s) }
+        do {
+            let creds = try ProjectFiles.loadCredentials()
+            let today = await MainActor.run { AppModel.dmyString(AppModel.monday(of: Date())) }
+            line("login #1 (session A)…")
+            let sessionA = try await client.login(creds)
+            line("login #2 (steals session A)…")
+            _ = try await client.login(creds)
+
+            // Test 1: stale token throws sessionExpired directly
+            do {
+                _ = try await client.getMyPunches(sessionA, date: today)
+                line("FAIL: stale token did NOT throw sessionExpired")
+            } catch {
+                if case VTAPIError.sessionExpired = error {
+                    line("PASS: stale token -> sessionExpired detected")
+                } else {
+                    line("FAIL: stale token threw \(error)")
+                }
+            }
+
+            // Test 2: replicate withSession logic — stale→catch→re-login→retry succeeds
+            do {
+                _ = try await client.getMyPunches(sessionA, date: today)
+                line("FAIL: stale token should have failed")
+            } catch {
+                if case VTAPIError.sessionExpired = error {
+                    line("INFO: stale token failed as expected, re-logging in…")
+                    let freshSession = try await client.login(creds)
+                    let punches = try await client.getMyPunches(freshSession, date: today)
+                    line("PASS: re-login retry succeeded, got \(punches.count) punches")
+                } else {
+                    line("FAIL: unexpected error: \(error)")
+                }
+            }
+        } catch {
+            line("ERROR: \(error.localizedDescription)")
+        }
+        NSApp.terminate(nil)
     }
 
     /// Dev hook: verify the API port against the live portal and exit.

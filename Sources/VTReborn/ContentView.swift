@@ -5,12 +5,18 @@ struct ContentView: View {
     @ObservedObject private var settings = AppSettings.shared
     @State private var expandedGroups: Set<String> = ["incomplete"]
     @State private var showDismissed = false
+    @State private var isBookingMode = false
+    @State private var bookingStart: Date?
+    @State private var bookingEnd: Date?
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 5)
 
     var body: some View {
         VStack(spacing: 0) {
             topBar
+            if model.sessionExpired {
+                sessionExpiredBanner
+            }
             Divider()
             tabBar
             Divider()
@@ -18,6 +24,27 @@ struct ContentView: View {
         }
         .padding(12)
         .frame(width: 760, height: 520)
+    }
+
+    // MARK: - Session expired banner
+
+    private var sessionExpiredBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+            Text("Session expired — punches won't update until you sign in again.")
+                .font(.subheadline)
+            Spacer()
+            Button("Re-login") {
+                model.reLogin()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.bottom, 8)
     }
 
     // MARK: - Top bar
@@ -233,20 +260,161 @@ struct ContentView: View {
     private var accrualSection: some View {
         let meaningful = model.accruals.filter(\.isMeaningful)
         return SettingsSection(title: "Vacation balance") {
-            if meaningful.isEmpty {
+            if model.isVacationLoading && meaningful.isEmpty {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading balance…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 22)
+            } else if meaningful.isEmpty {
                 Text("No accrual data available")
                     .foregroundStyle(.secondary)
             } else {
-                balanceCard
-                let others = meaningful.filter { $0.id != currentYearAccrual?.id }
-                if !others.isEmpty {
-                    HStack(spacing: 10) {
+                HStack(alignment: .top, spacing: 10) {
+                    balanceCard
+                    let others = meaningful.filter { $0.id != currentYearAccrual?.id }
+                    if !others.isEmpty {
                         ForEach(others) { accrual in
                             secondaryAccrualCard(accrual)
                         }
                     }
                 }
             }
+        }
+    }
+
+    private var bookingControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(bookingHint, systemImage: "hand.tap.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Cancel") {
+                    exitBookingMode()
+                    model.vacationBookingFeedback = nil
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            HStack(spacing: 8) {
+                if let start = bookingStart {
+                    HStack(spacing: 4) {
+                        Image(systemName: "calendar")
+                            .foregroundStyle(.green)
+                        Text(shortDate(start))
+                            .font(.subheadline.bold())
+                        if let end = bookingEnd {
+                            Text("→")
+                                .foregroundStyle(.secondary)
+                            Text(shortDate(end))
+                                .font(.subheadline.bold())
+                        }
+                        Text("(\(selectedWorkingDates.count) \(selectedWorkingDates.count == 1 ? "day" : "days"))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Clear") {
+                        bookingStart = nil
+                        bookingEnd = nil
+                    }
+                    .buttonStyle(.link)
+                    .controlSize(.small)
+                } else {
+                    Text("No days selected yet.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                }
+
+                Button {
+                    Task {
+                        await model.submitVacationRequest(dates: selectedWorkingDates, comments: "")
+                        if model.vacationBookingFeedbackIsError == false, model.vacationBookingFeedback != nil {
+                            exitBookingMode()
+                        }
+                    }
+                } label: {
+                    if model.isBookingVacation {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Label("Submit Request", systemImage: "paperplane.fill")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+                .fixedSize()
+                .disabled(model.isBookingVacation || bookingStart == nil || selectedWorkingDates.count > bookableThisYear)
+            }
+
+            if let feedback = model.vacationBookingFeedback {
+                Label(feedback, systemImage: model.vacationBookingFeedbackIsError ? "xmark.circle.fill" : "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(model.vacationBookingFeedbackIsError ? .red : .green)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(10)
+        .background(Color.green.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func enterBookingMode() {
+        isBookingMode = true
+        bookingStart = nil
+        bookingEnd = nil
+        model.vacationBookingFeedback = nil
+    }
+
+    private func exitBookingMode() {
+        isBookingMode = false
+        bookingStart = nil
+        bookingEnd = nil
+    }
+
+    private func shortDate(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "EEE, MMM d"
+        return f.string(from: date)
+    }
+
+    /// All working days in the selected range (weekends and bank holidays excluded).
+    /// A single tapped day with no end yet books just that one day.
+    private var selectedWorkingDates: [Date] {
+        guard let start = bookingStart else { return [] }
+        if let end = bookingEnd, end > start {
+            return workingDates(from: start, through: end)
+        }
+        return [start]
+    }
+
+    private func workingDates(from start: Date, through end: Date) -> [Date] {
+        let cal = Calendar.current
+        var dates: [Date] = []
+        var d = cal.startOfDay(for: start)
+        let last = cal.startOfDay(for: end)
+        while d <= last {
+            let weekday = cal.component(.weekday, from: d)
+            if weekday != 1, weekday != 7, !isBankHoliday(d) {
+                dates.append(d)
+            }
+            d = cal.date(byAdding: .day, value: 1, to: d)!
+        }
+        return dates
+    }
+
+    private func isBankHoliday(_ date: Date) -> Bool {
+        let cal = Calendar.current
+        let key = cal.startOfDay(for: date)
+        return model.calendarDays.contains { day in
+            cal.startOfDay(for: day.date) == key && (day.isBankHoliday || day.isHoliday)
         }
     }
 
@@ -258,56 +426,54 @@ struct ContentView: View {
         }
     }
 
-    /// Days still free to book this year: current balance minus forecast/planned use.
+    /// Days still free to book this year: current balance minus already-scheduled days.
     private var bookableThisYear: Int {
-        guard let accrual = currentYearAccrual else { return 0 }
-        return max(accrual.available - accrual.prevision, 0)
+        max(model.availableBookableDays ?? 0, 0)
+    }
+
+    /// Scheduled (already booked) vacation days this year, from today onwards.
+    /// Counts the same future days the calendar already renders.
+    private var plannedThisYear: Int {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let thisYear = cal.component(.year, from: today)
+        return model.vacationDates.reduce(into: 0) { count, date in
+            let d = cal.startOfDay(for: date)
+            if d >= today, cal.component(.year, from: d) == thisYear {
+                count += 1
+            }
+        }
     }
 
     private var balanceCard: some View {
         let accrual = currentYearAccrual
         let taken = max(accrual?.done ?? 0, 0)
-        let planned = max(accrual?.prevision ?? 0, 0)
+        let planned = plannedThisYear
         let bookable = bookableThisYear
         let total = max(taken + planned + bookable, 1)
-        let available = max(accrual?.available ?? 0, 0)
 
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("This year")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text("\(bookable)")
-                            .font(.largeTitle.bold())
-                            .foregroundStyle(.green)
-                        Text("days free to book")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("Total entitlement")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    Text("\(total) days")
-                        .font(.subheadline.bold())
-                }
-            }
-
-            segmentBar(taken: taken, planned: planned, bookable: bookable, total: total)
-
-            HStack(spacing: 14) {
-                segmentLegend(color: .secondary.opacity(0.6), label: "Taken \(taken)")
-                segmentLegend(color: .orange, label: "Planned \(planned)")
-                segmentLegend(color: .green, label: "Free \(bookable)")
-                Spacer()
-                Text("Available now: \(available) days")
-                    .font(.caption2)
+        return HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 0) {
+                Text("\(bookable)")
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundStyle(.green)
+                    .monospacedDigit()
+                Text("free to book")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .frame(width: 84, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 6) {
+                segmentBar(taken: taken, planned: planned, bookable: bookable, total: total)
+
+                HStack(spacing: 10) {
+                    segmentLegend(color: .secondary.opacity(0.6), label: "Taken \(taken)")
+                    segmentLegend(color: .orange, label: "Planned \(planned)")
+                    segmentLegend(color: .green, label: "Free \(bookable)")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(12)
         .frame(maxWidth: .infinity)
@@ -348,35 +514,40 @@ struct ContentView: View {
             Text(label)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
         }
     }
 
     private func secondaryAccrualCard(_ accrual: HolidayAccrual) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(accrual.name)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(accrual.displayName)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .lineLimit(1)
+                .help(accrual.name)
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text("\(accrual.available)")
                     .font(.title3.bold())
+                    .monospacedDigit()
                 Text(accrual.valueFormat == "H" ? "h" : "days")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Text("Taken: \(accrual.done)")
-                .font(.caption)
+                .font(.caption2)
                 .foregroundStyle(.secondary)
         }
         .padding(10)
-        .frame(maxWidth: .infinity, minHeight: 84, alignment: .leading)
+        .frame(width: 168, alignment: .leading)
         .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private var calendarSection: some View {
         SettingsSection(title: "Shift calendar") {
             VStack(spacing: 8) {
+                bookingBar
+
                 HStack(spacing: 8) {
                     Button {
                         model.goPreviousMonth()
@@ -418,6 +589,75 @@ struct ContentView: View {
         }
     }
 
+    /// Booking state machine shown right above the calendar grid: idle offers a
+    /// "Book vacation" entry point, active hosts the inline selection controls.
+    @ViewBuilder
+    private var bookingBar: some View {
+        if model.selectedShiftId == nil {
+            if model.isVacationLoading {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading shift data…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+            } else if model.shiftDataLoadFailed {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Couldn't load your shift. \(model.calendarDays.isEmpty ? "Check your connection and retry." : "")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Retry") {
+                        Task { await model.refreshVacation() }
+                    }
+                    .font(.caption)
+                }
+                .padding(10)
+            }
+        } else if isBookingMode {
+            bookingControls
+        } else {
+            HStack(spacing: 12) {
+                Label("Book vacation days", systemImage: "calendar.badge.plus")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if bookableThisYear > 0 {
+                    Text("\(bookableThisYear) day\(bookableThisYear == 1 ? "" : "s") available")
+                        .font(.caption.bold())
+                        .foregroundStyle(.green)
+                    Spacer()
+                    Button("Select dates") {
+                        enterBookingMode()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                } else {
+                    Text("No days available")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+            .padding(10)
+            .background(Color.green.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private var bookingHint: String {
+        if bookingStart == nil {
+            return "Tap a vacation day to book it (tap a second one to make a range)."
+        } else if bookingEnd == nil {
+            return "\(selectedWorkingDates.count) day(s) selected — tap a second day to extend or submit now."
+        } else {
+            return "\(selectedWorkingDates.count) day(s) selected — submit when ready."
+        }
+    }
+
     private var calendarGrid: some View {
         let weekdayHeader = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
@@ -448,11 +688,11 @@ struct ContentView: View {
                 VStack(spacing: 2) {
                     Text("\(day.dayNumber)")
                         .font(.caption.bold())
-                        .foregroundStyle(day.isToday ? Color.primary : .secondary)
+                        .foregroundStyle(cellTextColor(day))
 
                     Text(day.shiftShortName ?? "—")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(cellTextColor(day).opacity(0.6))
                         .lineLimit(1)
                         .minimumScaleFactor(0.6)
                 }
@@ -462,7 +702,7 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
-                        .stroke(day.isToday ? Color.blue : Color.clear, lineWidth: 1.5)
+                        .stroke(cellStroke(day), lineWidth: 1.5)
                 )
                 .overlay(alignment: .topLeading) {
                     if day.isVacation {
@@ -475,17 +715,103 @@ struct ContentView: View {
                             .padding(2)
                     }
                 }
+                .contentShape(RoundedRectangle(cornerRadius: 6))
+                .onTapGesture {
+                    if isBookingMode {
+                        handleDayTap(day)
+                    }
+                }
                 .help(cellHelp(day))
             }
         }
     }
 
+    /// Skyscanner-style range selection: first tap sets the start, second sets the
+    /// end; tapping again restarts the range. Weekends and bank holidays are skipped.
+    private func handleDayTap(_ day: CalendarDayVM) {
+        guard isBookableDay(day) else { return }
+        let cal = Calendar.current
+        let date = cal.startOfDay(for: day.date)
+
+        if let start = bookingStart {
+            if let end = bookingEnd {
+                // Range complete → start a fresh range with this day.
+                bookingStart = date
+                bookingEnd = nil
+            } else if date < start {
+                // Tapped before the start → move the start.
+                bookingStart = date
+            } else if date == start {
+                bookingStart = nil
+            } else {
+                // End tap: only accept if it stays within the available days.
+                let count = workingDates(from: start, through: date).count
+                guard count <= bookableThisYear else { return }
+                bookingEnd = date
+            }
+        } else {
+            bookingStart = date
+        }
+    }
+
+    private func cellStroke(_ day: CalendarDayVM) -> Color {
+        if isBookingMode, isDaySelected(day) || isDayInRange(day) {
+            return Color.green.opacity(0.6)
+        } else if day.isToday {
+            return Color.blue
+        } else {
+            return Color.clear
+        }
+    }
+
+    private func cellTextColor(_ day: CalendarDayVM) -> Color {
+        if isBookingMode, !isBookableDay(day) {
+            return .secondary.opacity(0.35)
+        } else if day.isToday {
+            return .primary
+        } else {
+            return .secondary
+        }
+    }
+
+    private func isDaySelected(_ day: CalendarDayVM) -> Bool {
+        let cal = Calendar.current
+        let date = cal.startOfDay(for: day.date)
+        return date == bookingStart || date == bookingEnd
+    }
+
+    private func isDayInRange(_ day: CalendarDayVM) -> Bool {
+        guard isBookableDay(day) else { return false }
+        guard let start = bookingStart, let end = bookingEnd else { return false }
+        let cal = Calendar.current
+        let date = cal.startOfDay(for: day.date)
+        guard date > start, date < end else { return false }
+        return true
+    }
+
+    /// Whether a calendar day can be picked as part of a vacation booking:
+    /// no past days, weekends, bank holidays or days already marked as vacation.
+    private func isBookableDay(_ day: CalendarDayVM) -> Bool {
+        guard !day.isVacation, !day.isBankHoliday else { return false }
+        let cal = Calendar.current
+        let date = cal.startOfDay(for: day.date)
+        let weekday = cal.component(.weekday, from: date)
+        guard weekday != 1, weekday != 7 else { return false }
+        return date >= cal.startOfDay(for: Date())
+    }
+
     @ViewBuilder
     private func cellBackground(_ day: CalendarDayVM) -> some View {
-        if day.isVacation || day.isHoliday {
+        if isBookingMode, isDaySelected(day) {
+            Color.green.opacity(0.45)
+        } else if isBookingMode, isDayInRange(day) {
             Color.green.opacity(0.18)
         } else if day.isBankHoliday {
             Color.gray.opacity(0.28)
+        } else if isBookingMode, !isBookableDay(day) {
+            Color.gray.opacity(0.1)
+        } else if day.isVacation || day.isHoliday {
+            Color.green.opacity(0.18)
         } else if day.isAbsenceDay || day.isAbsenceHours {
             Color.orange.opacity(0.2)
         } else if day.isToday {
