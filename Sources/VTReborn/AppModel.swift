@@ -178,6 +178,7 @@ final class AppModel: ObservableObject {
         week = Self.loadCachedWeek()
         loadCachedCalendar()
         loadSettledDays()
+        loadVacationSnapshot()
     }
 
     private let api = VTAPIClient()
@@ -433,6 +434,60 @@ final class AppModel: ObservableObject {
         let snapshot = settledDays
         Task.detached(priority: .utility) {
             guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    // MARK: - Vacation snapshot (disk)
+
+    /// Everything the vacation tab shows besides the calendar grid, so it
+    /// renders instantly on launch instead of waiting on four requests.
+    private struct VacationSnapshot: Codable {
+        let savedAt: Date
+        let accruals: [HolidayAccrual]
+        let vacationDates: [Date]
+        let selectedShiftId: Int?
+        let availableHolidayDays: Double?
+    }
+
+    /// A snapshot younger than this is trusted without re-fetching.
+    private static let vacationFreshWindow: TimeInterval = 30 * 60
+    private var vacationLoadedAt: Date?
+
+    var vacationIsFresh: Bool {
+        guard let at = vacationLoadedAt else { return false }
+        return Date().timeIntervalSince(at) < Self.vacationFreshWindow
+    }
+
+    private static func vacationCacheURL() -> URL? {
+        cacheURL()?.deletingLastPathComponent().appendingPathComponent("vacation.json")
+    }
+
+    private func loadVacationSnapshot() {
+        guard let url = Self.vacationCacheURL(),
+              let data = try? Data(contentsOf: url),
+              let snap = try? JSONDecoder().decode(VacationSnapshot.self, from: data) else { return }
+        accruals = snap.accruals
+        vacationDates = Set(snap.vacationDates)
+        selectedShiftId = snap.selectedShiftId
+        availableHolidayDays = snap.availableHolidayDays
+        vacationLoadedAt = snap.savedAt
+        // A fresh snapshot came with a full calendar fetch, so every month on
+        // disk is current too.
+        if vacationIsFresh {
+            calendarFetchedMonths.formUnion(calendarDays.map { calendarMonthKey($0.date) })
+        }
+    }
+
+    private func saveVacationSnapshot() {
+        vacationLoadedAt = Date()
+        guard let url = Self.vacationCacheURL() else { return }
+        let snap = VacationSnapshot(
+            savedAt: vacationLoadedAt!, accruals: accruals, vacationDates: Array(vacationDates),
+            selectedShiftId: selectedShiftId, availableHolidayDays: availableHolidayDays
+        )
+        Task.detached(priority: .utility) {
+            guard let data = try? JSONEncoder().encode(snap) else { return }
             try? data.write(to: url, options: .atomic)
         }
     }
@@ -782,10 +837,17 @@ final class AppModel: ObservableObject {
             self.accruals = accruals
             self.mergeCalendarDays(days)
             self.vacationDates = Self.parseVacationDates(from: requests)
-            self.selectedShiftId = nil
-            await self.refreshVacationShift()
+            // The vacation concept never changes, so only look it up once; the
+            // available-days figure does change and is re-read every time.
+            if self.selectedShiftId == nil {
+                await self.refreshVacationShift()
+            } else {
+                await self.fetchAvailableHolidaysDays()
+            }
             if self.selectedShiftId == nil {
                 shiftDataLoadFailed = true
+            } else {
+                saveVacationSnapshot()
             }
         } catch {
             appendLog("Vacation refresh failed: \(error.localizedDescription)", level: .error)

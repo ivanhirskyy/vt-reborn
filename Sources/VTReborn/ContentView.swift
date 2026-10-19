@@ -251,7 +251,7 @@ struct ContentView: View {
             .padding(.vertical, 12)
         }
         .onAppear {
-            if model.accruals.isEmpty || model.calendarDays.isEmpty {
+            if !model.vacationIsFresh || model.accruals.isEmpty || model.calendarDays.isEmpty {
                 Task { await model.refreshVacation() }
             }
         }
