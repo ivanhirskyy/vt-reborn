@@ -389,6 +389,12 @@ final class AppModel: ObservableObject {
                     group.addTask { (i, settled) }
                     continue
                 }
+                // Future days can't have punches yet; nothing to ask the portal.
+                if date > Calendar.current.startOfDay(for: Date()) {
+                    let empty = DayData(date: iso, dmy: dmy, punches: [])
+                    group.addTask { (i, empty) }
+                    continue
+                }
                 group.addTask { [api] in
                     let punches = try await api.getMyPunches(session, date: dmy)
                     return (i, DayData(
@@ -460,6 +466,10 @@ final class AppModel: ObservableObject {
                 days.append(settled)
             } else if date < today && isNonWorkingDay(date) {
                 // No punches expected, nothing to fetch.
+                days.append(DayData(date: iso, dmy: Self.dmyString(date), punches: []))
+            } else if date > today && hasCalendarData(for: Self.firstOfMonth(of: date)) {
+                // Future day: no punches yet, and the calendar already knows
+                // whether it's a holiday/vacation.
                 days.append(DayData(date: iso, dmy: Self.dmyString(date), punches: []))
             } else {
                 return false
