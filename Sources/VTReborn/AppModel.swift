@@ -41,6 +41,8 @@ struct DayVM: Identifiable {
     let dmy: String
     let isToday: Bool
     let punches: [Punch]
+    /// Submitted but not yet confirmed by the portal (shown optimistically).
+    let pendingPunches: [Punch]
     let status: DayStatus
     let isVacation: Bool
     let isHoliday: Bool
@@ -93,6 +95,8 @@ final class AppModel: ObservableObject {
     @Published var week: WeekData?
     @Published var logs: [LogEntry] = []
     @Published var isBusy = false
+    /// Backfilled punches awaiting portal confirmation, keyed by ISO date.
+    @Published var pendingPunches: [String: [Punch]] = [:]
     @Published var isRefreshing = false
     @Published var isSigningIn = false
     @Published var loginFeedback: String?
@@ -281,6 +285,9 @@ final class AppModel: ObservableObject {
             let punches = punchByDate[iso] ?? []
             let calendarDay = calendarByDate[cal.startOfDay(for: date)]
             let nonWorking = isNonWorkingDay(date)
+            let realIDs = Set(punches.map(\.id))
+            let pending = (pendingPunches[iso] ?? []).filter { !realIDs.contains($0.id) }
+            let shown = punches + pending
             return DayVM(
                 index: i,
                 date: date,
@@ -289,9 +296,10 @@ final class AppModel: ObservableObject {
                 dmy: dmy(date),
                 isToday: cal.isDate(date, inSameDayAs: today),
                 punches: punches,
-                status: nonWorking && punches.isEmpty && date <= today
+                pendingPunches: pending,
+                status: nonWorking && shown.isEmpty && date <= today
                     ? .complete
-                    : DayStatus(from: punches, isToday: cal.isDate(date, inSameDayAs: today)),
+                    : DayStatus(from: shown, isToday: cal.isDate(date, inSameDayAs: today)),
                 isVacation: vacationDates.contains(cal.startOfDay(for: date)),
                 isHoliday: calendarDay?.isHoliday ?? false,
                 isBankHoliday: calendarDay?.isBankHoliday ?? false,
@@ -1287,9 +1295,12 @@ private func backfillCore(date: Date, dmy: String, isFuture: Bool) {
 private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, session: Session) async {
     isBusy = true
     appendLog("Submitting \(plans.count) punch(es) for \(dmy)...")
+    let isoDate = Self.dateFormatter.ymd(from: date)
+    // Show the punches right away; the portal confirms (or the refresh below
+    // rolls back whatever didn't go through).
+    pendingPunches[isoDate] = plans.map { Punch(time: $0.expectedTime, type: $0.direction) }
     do {
         let delayNs: UInt64 = 3_000_000_000
-        let isoDate = Self.dateFormatter.ymd(from: date)
         for (i, plan) in plans.enumerated() {
             if i > 0 {
                 appendLog("waiting 3s...", level: .info)
@@ -1313,6 +1324,7 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
     }
     isBusy = false
     await refreshDay(date)
+    pendingPunches[isoDate] = nil
     await refreshAlerts()
 }
 

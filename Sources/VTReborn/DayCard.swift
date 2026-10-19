@@ -117,7 +117,8 @@ struct DayCard: View {
 
     private var punchList: some View {
         VStack(alignment: .leading, spacing: 2) {
-            ForEach(day.punches) { punch in
+            ForEach((day.punches.map { ($0, false) } + day.pendingPunches.map { ($0, true) })
+                .sorted { $0.0.time < $1.0.time }, id: \.0.id) { punch, pending in
                 HStack(spacing: 6) {
                     Text(punch.type == "in" ? "In" : "Out")
                         .font(.caption2.bold())
@@ -125,10 +126,16 @@ struct DayCard: View {
                         .foregroundStyle(punch.type == "in" ? Color.blue : Color.orange)
                     Text(punch.time)
                         .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.primary)
+                        .foregroundStyle(pending ? .secondary : .primary)
+                    if pending {
+                        Image(systemName: "clock")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .help("Submitted — waiting for the portal to confirm")
+                    }
                 }
             }
-            if day.punches.isEmpty {
+            if day.punches.isEmpty && day.pendingPunches.isEmpty {
                 Text("—")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
