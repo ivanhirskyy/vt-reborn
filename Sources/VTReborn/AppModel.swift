@@ -1016,6 +1016,31 @@ final class AppModel: ObservableObject {
         AppSettings.shared.handledPunchDates.insert(Self.dateFormatter.ymd(from: date))
     }
 
+    /// First configured slot still ahead of `now` (local clock).
+    static func nextSlot(configs: [PunchConfig], now: Date = Date()) -> PunchConfig? {
+        let nowMins = minutesOfDay(now)
+        return configs
+            .filter { hourMinToMins($0.time) > nowMins }
+            .min { hourMinToMins($0.time) < hourMinToMins($1.time) }
+    }
+
+    /// One-line summary of today for the menu bar, e.g. "IN 07:30 · next OUT 12:00".
+    var todaySummary: String {
+        let iso = Self.dateFormatter.ymd(from: Date())
+        guard let day = week?.days.first(where: { $0.date == iso }) else { return "No data for today yet" }
+        if isNonWorkingDay(Date()) { return "Vacation / holiday — nothing to punch" }
+        let recorded = day.punches.isEmpty
+            ? "No punches yet"
+            : day.punches.map { "\($0.type.uppercased()) \($0.time)" }.joined(separator: " · ")
+        guard let next = Self.nextSlot(configs: AppSettings.shared.punchConfigs) else { return recorded }
+        return "\(recorded)  ›  next \(next.type.uppercased()) \(next.time)"
+    }
+
+    /// Whether the menu should offer "Backfill today".
+    var canBackfillToday: Bool {
+        !isBusy && !isNonWorkingDay(Date())
+    }
+
     var urgentAlertCount: Int {
         visibleAlerts.filter { $0.isUrgent || $0.isCritic }.count
     }

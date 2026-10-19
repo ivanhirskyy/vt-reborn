@@ -153,3 +153,16 @@ final class SchedulerDecisionTests: XCTestCase {
         XCTAssertEqual(decide("out", scheduled: at(12, 0), now: at(12, 2), last: ("out", at(8, 0))), .run)
     }
 }
+
+@MainActor
+final class NextSlotTests: XCTestCase {
+    func testNextSlotIsFirstOneAhead() {
+        XCTAssertEqual(AppModel.nextSlot(configs: schedule, now: at(10, 16))?.time, "12:00")
+        XCTAssertEqual(AppModel.nextSlot(configs: schedule, now: at(6, 0))?.time, "07:30")
+        XCTAssertEqual(AppModel.nextSlot(configs: schedule, now: at(12, 30))?.time, "13:00")
+    }
+
+    func testNoNextSlotAfterTheLastOne() {
+        XCTAssertNil(AppModel.nextSlot(configs: schedule, now: at(17, 0)))
+    }
+}
