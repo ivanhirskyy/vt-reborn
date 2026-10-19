@@ -151,6 +151,9 @@ final class AppModel: ObservableObject {
 
     /// When the loaded week was last confirmed against the portal.
     private var lastWeekRefresh: Date?
+    /// Presence reported by the last live punch. The login-time value in the
+    /// cached session goes stale as soon as you clock in or out.
+    private var livePresence: (status: String, direction: String)?
     /// A week refreshed this recently is trusted for the backfill preview.
     private static let freshWeekWindow: TimeInterval = 120
 
@@ -197,6 +200,7 @@ final class AppModel: ObservableObject {
         let session = try await api.login(try ProjectFiles.loadCredentials())
         appendLog("Logged in as: \(session.employeeName) · \(session.presenceStatus)", level: .success)
         cachedSession = session
+        livePresence = nil
         if let data = try? JSONEncoder().encode(session) {
             _ = Keychain.save(key: Self.sessionKeychainKey, data: data)
         }
@@ -352,8 +356,8 @@ final class AppModel: ObservableObject {
 
             let fresh = WeekData(
                 employeeName: session.employeeName,
-                presenceStatus: session.presenceStatus,
-                lastPunchDirection: session.lastPunchDirection,
+                presenceStatus: livePresence?.status ?? session.presenceStatus,
+                lastPunchDirection: livePresence?.direction ?? session.lastPunchDirection,
                 lastPunchDate: session.lastPunchDate.map { $0.description },
                 weekStart: Self.dateFormatter.ymd(from: start),
                 days: days
@@ -515,6 +519,7 @@ final class AppModel: ObservableObject {
             do {
                 let session = try await requireSession()
                 let result = try await api.punch(session, direction: direction)
+                livePresence = (result.status, result.direction)
                 appendLog("Clocked \(direction)! Status: \(result.status)", level: .success)
             } catch {
                 if isSessionExpiredError(error) {
@@ -1339,6 +1344,7 @@ private func executeBackfill(_ plans: [BackfillPlan], date: Date, dmy: String, s
         do {
             let session = try await requireSession()
             let result = try await api.punch(session, direction: punch.type)
+            livePresence = (result.status, result.direction)
             appendLog("Punch \(punch.type.uppercased()) successful (status: \(result.status))", level: .success)
             await refresh()
         } catch {

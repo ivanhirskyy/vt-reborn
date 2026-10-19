@@ -90,6 +90,11 @@ struct DayCard: View {
     @ViewBuilder
     private var statusBadge: some View {
         switch day.status {
+        case .complete where day.isToday && !dayIsOver:
+            // Nothing overdue yet, but later slots are still ahead.
+            Label("On track", systemImage: "clock.fill")
+                .font(.caption2.bold())
+                .foregroundStyle(.blue)
         case .complete:
             Label("Done", systemImage: "checkmark.circle.fill")
                 .font(.caption2.bold())
@@ -103,6 +108,11 @@ struct DayCard: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    /// Today only reads "Done" once its first IN and last OUT are both recorded.
+    private var dayIsOver: Bool {
+        DayStatus(from: day.punches, isToday: false) == .complete
     }
 
     private var punchList: some View {

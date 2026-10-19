@@ -18,13 +18,13 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         if let button = statusItem.button {
             button.image = NSImage(
                 systemSymbolName: "clock.badge.checkmark",
-                accessibilityDescription: "VT Puncher"
+                accessibilityDescription: "VT Reborn"
             )
             button.image?.isTemplate = true
             button.target = self
             button.action = #selector(handleClick(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            button.toolTip = "VT Puncher"
+            button.toolTip = "VT Reborn"
         }
 
         popover.contentViewController = NSHostingController(

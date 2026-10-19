@@ -51,7 +51,7 @@ struct ContentView: View {
 
     private var topBar: some View {
         HStack(spacing: 12) {
-            Label("VT Puncher", systemImage: "clock.badge.checkmark")
+            Label("VT Reborn", systemImage: "clock.badge.checkmark")
                 .font(.title3.bold())
 
             Spacer()

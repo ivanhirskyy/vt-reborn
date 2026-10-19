@@ -20,7 +20,7 @@ final class MainWindowController {
 
         let host = NSHostingController(rootView: ContentView())
         let window = NSWindow(contentViewController: host)
-        window.title = "VT Puncher"
+        window.title = "VT Reborn"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.isReleasedWhenClosed = false
         window.setContentSize(NSSize(width: 784, height: 540))
